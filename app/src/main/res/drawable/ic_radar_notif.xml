@@ -14,11 +14,9 @@
         android:strokeColor="#FFFFFF"
         android:strokeWidth="1"
         android:pathData="M12,6 A6,6 0 1,1 11.999,6 Z" />
-    <circle
+    <path
         android:fillColor="#FFFFFF"
-        android:cx="12"
-        android:cy="12"
-        android:r="1.5" />
+        android:pathData="M10.5,12 A1.5,1.5 0 1,0 13.5,12 A1.5,1.5 0 1,0 10.5,12 Z" />
     <path
         android:fillColor="@android:color/transparent"
         android:strokeColor="#FFFFFF"
