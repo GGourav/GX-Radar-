@@ -1,0 +1,15 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+
+# Never commit APKs or keystores
+*.apk
+*.aab
+*.jks
+*.keystore
