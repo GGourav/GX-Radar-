@@ -7,6 +7,8 @@ import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.View
 import android.widget.Toast
@@ -25,6 +27,13 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private var discoveryLogger: DiscoveryLogger? = null
+    private val refreshHandler = Handler(Looper.getMainLooper())
+    private val refreshRunnable = object : Runnable {
+        override fun run() {
+            refreshUi()
+            refreshHandler.postDelayed(this, 2000)
+        }
+    }
 
     private val vpnLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -42,7 +51,6 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        // Safe init — wrapped so storage errors don't crash the app
         try { discoveryLogger = DiscoveryLogger(this) } catch (e: Exception) { }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -59,55 +67,54 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         refreshUi()
+        refreshHandler.postDelayed(refreshRunnable, 2000)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        refreshHandler.removeCallbacks(refreshRunnable)
     }
 
     private fun refreshUi() {
         val running = isRunning()
         binding.btnToggle.text = if (running) "Stop Radar" else "Start Radar"
-
-        val ent     = EntityStore.size()
-        val logKb   = discoveryLogger?.getDebugSizeKb() ?: 0
-        val disp    = EventDispatcher.totalDispatched
-        val added   = EventDispatcher.totalAdded
-
-        binding.tvStatus.text = if (running) {
-            "● ACTIVE  ENT=$ent  DISP=$disp  ADD=$added  LOG=${logKb}KB"
-        } else {
-            "○ STOPPED  last: ENT=$ent  LOG=${logKb}KB"
-        }
+        val ent   = EntityStore.size()
+        val logKb = discoveryLogger?.getDebugSizeKb() ?: 0
+        val disp  = EventDispatcher.totalDispatched
+        val added = EventDispatcher.totalAdded
+        val drop  = EventDispatcher.totalDropped
+        binding.tvStatus.text = if (running)
+            "● ACTIVE  ENT=$ent  DISP=$disp  ADD=$added  DROP=$drop  LOG=${logKb}KB"
+        else
+            "○ STOPPED  ENT=$ent  LOG=${logKb}KB"
         binding.tvStatus.setTextColor(
             getColor(if (running) R.color.status_on else R.color.status_off)
         )
         binding.btnOverlayPerm.visibility =
             if (Settings.canDrawOverlays(this)) View.GONE else View.VISIBLE
-
-        val hasLog = (discoveryLogger?.getDebugSizeKb() ?: 0) > 0
+        val hasLog = logKb > 0
         binding.btnShareLog.alpha = if (hasLog) 1.0f else 0.4f
-        binding.btnShareLog.text  = if (hasLog)
-            "📤 Share Debug Log (${logKb}KB)" else "📤 Share Debug Log"
+        binding.btnShareLog.text  = if (hasLog) "📤 Share Debug Log (${logKb}KB)" else "📤 Share Debug Log"
     }
 
     private fun shareDebugLog() {
-        val logger = discoveryLogger
-        if (logger == null) { toast("Logger not ready"); return }
+        val logger = discoveryLogger ?: run { toast("Logger not ready"); return }
         val file = logger.getDebugFile()
         if (!file.exists() || file.length() == 0L) {
             toast("No log yet — start radar, enter a zone, wait 15 sec")
             return
         }
         try {
-            val summary = "dispatched=${EventDispatcher.totalDispatched} " +
-                "added=${EventDispatcher.totalAdded} " +
-                "dropped=${EventDispatcher.totalDropped}\n\n"
-            val content = summary + file.readText()
-
-            // Share as plain text directly — no FileProvider needed
-            val intent = Intent(Intent.ACTION_SEND).apply {
-                type = "text/plain"
-                putExtra(Intent.EXTRA_TEXT, content)
-                putExtra(Intent.EXTRA_SUBJECT, "GX Radar Debug Log")
-            }
-            startActivity(Intent.createChooser(intent, "Share Debug Log"))
+            val content = "dispatched=${EventDispatcher.totalDispatched} " +
+                "added=${EventDispatcher.totalAdded} dropped=${EventDispatcher.totalDropped}\n\n" +
+                file.readText()
+            startActivity(Intent.createChooser(
+                Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_TEXT, content)
+                    putExtra(Intent.EXTRA_SUBJECT, "GX Radar Debug Log")
+                }, "Share Debug Log"
+            ))
         } catch (e: Exception) {
             toast("Share failed: ${e.message}")
         }
@@ -129,21 +136,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openOverlaySettings() {
-        startActivity(
-            Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:$packageName"))
-        )
+        startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+            Uri.parse("package:$packageName")))
     }
 
     private fun startServices() {
-        startForegroundService(
-            Intent(this, AlbionVpnService::class.java)
-                .setAction(AlbionVpnService.ACTION_START)
-        )
-        startForegroundService(
-            Intent(this, RadarOverlayService::class.java)
-                .setAction(RadarOverlayService.ACTION_START)
-        )
+        try {
+            startForegroundService(
+                Intent(this, AlbionVpnService::class.java)
+                    .setAction(AlbionVpnService.ACTION_START)
+            )
+        } catch (e: Exception) { toast("VPN start failed: ${e.message}") }
+        try {
+            startForegroundService(
+                Intent(this, RadarOverlayService::class.java)
+                    .setAction(RadarOverlayService.ACTION_START)
+            )
+        } catch (e: Exception) { toast("Overlay start failed: ${e.message}") }
         refreshUi()
         toast("GX Radar started")
     }
