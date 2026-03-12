@@ -23,16 +23,6 @@ import com.gxradar.data.model.EntityStore
 import com.gxradar.network.AlbionVpnService
 import com.gxradar.ui.MainActivity
 
-/**
- * RadarOverlayService — Step 2 debug HUD
- *
- * Shows a small floating counter:
- *   PKT  123   — total UDP packets seen by VPN
- *   ALB  45    — packets on port 5056 (Albion)
- *   ENT  12    — entities currently in EntityStore
- *
- * Step 4 replaces this with the full SurfaceView radar canvas.
- */
 class RadarOverlayService : LifecycleService() {
 
     companion object {
@@ -44,12 +34,11 @@ class RadarOverlayService : LifecycleService() {
     private var windowManager: WindowManager? = null
     private var hudView: TextView? = null
     private val handler = Handler(Looper.getMainLooper())
-    private val updateInterval = 1000L   // refresh HUD every second
 
     private val updateRunnable = object : Runnable {
         override fun run() {
             updateHud()
-            handler.postDelayed(this, updateInterval)
+            handler.postDelayed(this, 1000L)
         }
     }
 
@@ -58,8 +47,6 @@ class RadarOverlayService : LifecycleService() {
             if (intent?.action == ACTION_STOP) stopSelf()
         }
     }
-
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
@@ -72,17 +59,21 @@ class RadarOverlayService : LifecycleService() {
         if (intent?.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
         startForeground(NOTIF_ID, buildNotif())
         if (Settings.canDrawOverlays(this)) attachHud()
-        return START_STICKY
+        return START_NOT_STICKY  // ← KEY: don't restart after stopService()
     }
 
     override fun onDestroy() {
         handler.removeCallbacks(updateRunnable)
-        detachHud()
+        // Detach HUD on main thread
+        handler.post {
+            try {
+                hudView?.let { windowManager?.removeView(it) }
+            } catch (e: Exception) { /* already removed */ }
+            hudView = null
+        }
         runCatching { unregisterReceiver(stopReceiver) }
         super.onDestroy()
     }
-
-    // ── HUD ───────────────────────────────────────────────────────────────────
 
     private fun attachHud() {
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
@@ -91,8 +82,8 @@ class RadarOverlayService : LifecycleService() {
         val tv = TextView(this).apply {
             setBackgroundColor(Color.argb(180, 0, 0, 0))
             setTextColor(Color.parseColor("#2979FF"))
-            textSize   = 11f
-            typeface   = Typeface.MONOSPACE
+            textSize  = 11f
+            typeface  = Typeface.MONOSPACE
             setPadding(12, 8, 12, 8)
             text = "GX RADAR\nPKT  --\nALB  --\nENT  --"
         }
@@ -100,8 +91,7 @@ class RadarOverlayService : LifecycleService() {
 
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        else
-            @Suppress("DEPRECATION")
+        else @Suppress("DEPRECATION")
             WindowManager.LayoutParams.TYPE_PHONE
 
         val params = WindowManager.LayoutParams(
@@ -109,28 +99,12 @@ class RadarOverlayService : LifecycleService() {
             WindowManager.LayoutParams.WRAP_CONTENT,
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-            WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = 16
-            y = 48
-        }
+        ).apply { gravity = Gravity.TOP or Gravity.START; x = 16; y = 48 }
 
-        try {
-            wm.addView(tv, params)
-            handler.post(updateRunnable)
-        } catch (e: Exception) {
-            // Overlay permission revoked mid-session
-        }
-    }
-
-    private fun detachHud() {
-        try {
-            hudView?.let { windowManager?.removeView(it) }
-        } catch (e: Exception) { /* already removed */ }
-        hudView = null
+        try { wm.addView(tv, params); handler.post(updateRunnable) }
+        catch (e: Exception) { /* overlay perm revoked */ }
     }
 
     private fun updateHud() {
@@ -140,18 +114,15 @@ class RadarOverlayService : LifecycleService() {
         hudView?.text = "GX RADAR\nPKT  $pkt\nALB  $alb\nENT  $ent"
     }
 
-    // ── Notification ──────────────────────────────────────────────────────────
-
     private fun buildNotif() =
         NotificationCompat.Builder(this, GXRadarApplication.CHANNEL_RADAR)
-            .setContentTitle("GX Radar — Overlay Active")
-            .setContentText("Tap to open settings")
+            .setContentTitle("GX Radar — Overlay")
+            .setContentText("Tap to open")
             .setSmallIcon(R.drawable.ic_radar_notif)
             .setOngoing(true).setSilent(true)
             .setContentIntent(
                 PendingIntent.getActivity(
-                    this, 0,
-                    Intent(this, MainActivity::class.java),
+                    this, 0, Intent(this, MainActivity::class.java),
                     PendingIntent.FLAG_IMMUTABLE
                 )
             ).build()
