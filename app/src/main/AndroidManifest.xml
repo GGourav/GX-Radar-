@@ -5,11 +5,14 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
 
     <application
         android:name=".GXRadarApplication"
@@ -22,6 +25,7 @@
         android:hardwareAccelerated="true"
         tools:targetApi="34">
 
+        <!-- Main UI -->
         <activity
             android:name=".ui.MainActivity"
             android:exported="true"
@@ -33,6 +37,7 @@
             </intent-filter>
         </activity>
 
+        <!-- VPN: rootless packet capture — only Albion traffic enters TUN -->
         <service
             android:name=".network.AlbionVpnService"
             android:exported="false"
@@ -42,15 +47,12 @@
             </intent-filter>
         </service>
 
+        <!-- Overlay: Step 4 will add SurfaceView radar drawing -->
         <service
             android:name=".overlay.RadarOverlayService"
-            android:exported="false"
-            android:foregroundServiceType="specialUse">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="radar_overlay" />
-        </service>
+            android:exported="false" />
 
+        <!-- Boot receiver -->
         <receiver
             android:name=".util.BootReceiver"
             android:exported="false">
