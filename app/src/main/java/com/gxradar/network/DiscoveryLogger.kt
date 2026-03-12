@@ -10,77 +10,64 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Discovery Logger — Plan B
+ * DiscoveryLogger
  *
- * Every entity spawn that has no DB match is written here immediately.
- * After a play session, pull the log with:
- *
- *   adb pull /sdcard/Android/data/com.gxradar.debug/files/unknown_entities.log
- *
- * The typeId → uniqueName pairs it captures seed the Step 3 SQLite DB.
- *
- * Log format: timestamp|eventCode|typeId|uniqueName|posX|posZ
+ * Two log files:
+ *   unknown_entities.log  — Plan B: unmatched entity typeIds
+ *   debug.log             — Full event dump for diagnostics (share via app)
  */
 class DiscoveryLogger(context: Context) {
 
     companion object {
-        private const val TAG           = "DiscoveryLogger"
-        private const val LOG_FILENAME  = "unknown_entities.log"
-        private const val MAX_SIZE_MB   = 10L
-        private const val HEADER        =
-            "# GX Radar — Discovery Log\n# timestamp|eventCode|typeId|uniqueName|posX|posZ\n"
+        private const val TAG          = "DiscoveryLogger"
+        private const val UNKNOWN_LOG  = "unknown_entities.log"
+        private const val DEBUG_LOG    = "debug.log"
+        private const val MAX_SIZE_MB  = 5L
+        private const val DEBUG_MAX_MB = 2L
     }
 
-    private val logFile: File = File(
-        context.getExternalFilesDir(null),
-        LOG_FILENAME
-    )
-
-    // Writer shared across calls — opened/closed per write to avoid leaks
-    private val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+    private val dir         = context.getExternalFilesDir(null) ?: context.filesDir
+    private val unknownFile = File(dir, UNKNOWN_LOG)
+    private val debugFile   = File(dir, DEBUG_LOG)
+    private val sdf         = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
     init {
-        logFile.parentFile?.mkdirs()
-        if (!logFile.exists()) logFile.writeText(HEADER)
-        Log.i(TAG, "Discovery log → ${logFile.absolutePath}")
+        dir.mkdirs()
+        if (!unknownFile.exists()) unknownFile.writeText("# GX Radar unknown entities\n# timestamp|eventCode|typeId|uniqueName|posX|posZ\n")
+        // Fresh debug log every app start
+        debugFile.writeText("# GX Radar Debug Log — ${Date()}\n")
+        Log.i(TAG, "Debug log: ${debugFile.absolutePath}")
     }
 
-    /**
-     * Log an entity that could not be resolved from the local DB.
-     * Thread-safe: appends synchronously (capture thread only).
-     */
-    fun logUnknownEntity(
-        eventCode: Int,
-        typeId: Int,
-        uniqueName: String?,
-        posX: Float,
-        posZ: Float
-    ) {
-        rotatIfNeeded()
-        val line = buildString {
-            append(sdf.format(Date()))
-            append('|').append(eventCode)
-            append('|').append(typeId)
-            append('|').append(uniqueName ?: "")
-            append('|').append(posX)
-            append('|').append(posZ)
-            append('\n')
-        }
+    /** Log an entity the DB could not resolve (Plan B). */
+    fun logUnknownEntity(eventCode: Int, typeId: Int, uniqueName: String?, posX: Float, posZ: Float) {
+        rotateIfNeeded(unknownFile, MAX_SIZE_MB)
+        val line = "${sdf.format(Date())}|$eventCode|$typeId|${uniqueName ?: ""}|$posX|$posZ\n"
+        appendLine(unknownFile, line)
+    }
+
+    /** Write a debug line (any string). Called by EventDispatcher in debug mode. */
+    fun writeDebug(line: String) {
+        rotateIfNeeded(debugFile, DEBUG_MAX_MB)
+        appendLine(debugFile, "${sdf.format(Date())} $line\n")
+    }
+
+    fun getDebugFile(): File  = debugFile
+    fun getUnknownFile(): File = unknownFile
+    fun getDebugSizeKb(): Long = debugFile.length() / 1024
+
+    private fun appendLine(file: File, line: String) {
         try {
-            BufferedWriter(FileWriter(logFile, true)).use { it.write(line) }
+            BufferedWriter(FileWriter(file, true)).use { it.write(line) }
         } catch (e: Exception) {
             Log.e(TAG, "Write failed: ${e.message}")
         }
     }
 
-    fun getLogPath(): String = logFile.absolutePath
-
-    fun getLogSizeKb(): Long = logFile.length() / 1024
-
-    private fun rotatIfNeeded() {
-        if (logFile.length() > MAX_SIZE_MB * 1_048_576L) {
-            logFile.renameTo(File(logFile.parent, "$LOG_FILENAME.old"))
-            logFile.writeText(HEADER + "# (rotated — previous log saved as .old)\n")
+    private fun rotateIfNeeded(file: File, maxMb: Long) {
+        if (file.length() > maxMb * 1_048_576L) {
+            file.renameTo(File(dir, "${file.name}.old"))
+            file.writeText("# rotated\n")
         }
     }
 }
