@@ -1,6 +1,5 @@
 package com.gxradar.ui
 
-import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -27,7 +26,8 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private var discoveryLogger: DiscoveryLogger? = null
-    private val refreshHandler = Handler(Looper.getMainLooper())
+
+    private val refreshHandler  = Handler(Looper.getMainLooper())
     private val refreshRunnable = object : Runnable {
         override fun run() {
             refreshUi()
@@ -51,7 +51,7 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        try { discoveryLogger = DiscoveryLogger(this) } catch (e: Exception) { }
+        runCatching { discoveryLogger = DiscoveryLogger(this) }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             notifLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
@@ -101,7 +101,7 @@ class MainActivity : AppCompatActivity() {
         val logger = discoveryLogger ?: run { toast("Logger not ready"); return }
         val file = logger.getDebugFile()
         if (!file.exists() || file.length() == 0L) {
-            toast("No log yet — start radar, enter a zone, wait 15 sec")
+            toast("Start radar → enter zone → wait 15 sec → share")
             return
         }
         try {
@@ -113,7 +113,7 @@ class MainActivity : AppCompatActivity() {
                     type = "text/plain"
                     putExtra(Intent.EXTRA_TEXT, content)
                     putExtra(Intent.EXTRA_SUBJECT, "GX Radar Debug Log")
-                }, "Share Debug Log"
+                }, "Share Log"
             ))
         } catch (e: Exception) {
             toast("Share failed: ${e.message}")
@@ -141,34 +141,39 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startServices() {
-        try {
+        // Start VPN
+        runCatching {
             startForegroundService(
                 Intent(this, AlbionVpnService::class.java)
                     .setAction(AlbionVpnService.ACTION_START)
             )
-        } catch (e: Exception) { toast("VPN start failed: ${e.message}") }
-        try {
+        }.onFailure { toast("VPN error: ${it.message}") }
+
+        // Start Overlay
+        runCatching {
             startForegroundService(
                 Intent(this, RadarOverlayService::class.java)
                     .setAction(RadarOverlayService.ACTION_START)
             )
-        } catch (e: Exception) { toast("Overlay start failed: ${e.message}") }
+        }.onFailure { toast("Overlay error: ${it.message}") }
+
         refreshUi()
         toast("GX Radar started")
     }
 
     private fun stopServices() {
-        sendBroadcast(Intent(AlbionVpnService.ACTION_STOP).setPackage(packageName))
-        sendBroadcast(Intent(RadarOverlayService.ACTION_STOP).setPackage(packageName))
+        // stopService() directly — does NOT require broadcast receiver to be registered
+        runCatching { stopService(Intent(this, AlbionVpnService::class.java)) }
+        runCatching { stopService(Intent(this, RadarOverlayService::class.java)) }
         refreshUi()
         toast("GX Radar stopped")
     }
 
-    @Suppress("DEPRECATION")
     private fun isRunning(): Boolean {
-        val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        return am.getRunningServices(Int.MAX_VALUE).any {
-            it.service.className == RadarOverlayService::class.java.name
+        // Check if VPN is active by checking for our TUN notification
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        return nm.activeNotifications.any {
+            it.id == AlbionVpnService.NOTIF_ID || it.id == RadarOverlayService.NOTIF_ID
         }
     }
 
