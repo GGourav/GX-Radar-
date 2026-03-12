@@ -2,7 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Network & VPN (rootless packet capture — Albion East port 5056) -->
+    <!-- Network & VPN -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
@@ -45,17 +45,21 @@
             </intent-filter>
         </activity>
 
-        <!-- VPN Service: rootless UDP capture on port 5056 (Albion East) -->
+        <!-- VPN Service — foregroundServiceType required on Android 14+ -->
         <service
             android:name=".network.AlbionVpnService"
             android:exported="false"
+            android:foregroundServiceType="specialUse"
             android:permission="android.permission.BIND_VPN_SERVICE">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="vpn_packet_capture" />
         </service>
 
-        <!-- Overlay Service: SurfaceView radar renderer -->
+        <!-- Overlay Service -->
         <service
             android:name=".overlay.RadarOverlayService"
             android:exported="false"
