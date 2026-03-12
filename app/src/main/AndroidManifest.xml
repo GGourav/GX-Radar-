@@ -2,13 +2,26 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- Network -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Services -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!-- Overlay -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- Keep CPU alive -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Notifications -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Boot restart -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Storage for debug log (legacy devices) -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
@@ -37,7 +50,11 @@
             </intent-filter>
         </activity>
 
-        <!-- VPN: rootless packet capture — only Albion traffic enters TUN -->
+        <!--
+            VPN Service: rootless packet capture.
+            addAllowedApplication("com.albiononline") in code ensures
+            only Albion traffic enters TUN — no internet breakage.
+        -->
         <service
             android:name=".network.AlbionVpnService"
             android:exported="false"
@@ -47,7 +64,10 @@
             </intent-filter>
         </service>
 
-        <!-- Overlay: Step 4 will add SurfaceView radar drawing -->
+        <!--
+            Overlay Service: Step 4 will add SurfaceView radar drawing.
+            NO foregroundServiceType here — causes SecurityException on most devices.
+        -->
         <service
             android:name=".overlay.RadarOverlayService"
             android:exported="false" />
