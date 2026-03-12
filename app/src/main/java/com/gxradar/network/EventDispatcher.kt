@@ -10,19 +10,14 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * EventDispatcher — DEBUG VERSION
- *
- * Logs EVERY incoming Photon event so we can diagnose why ENT stays 0.
- * Tag: GXDebug
- *
- * To view logs:
- *   adb logcat -s GXDebug:V *:S
+ * EventDispatcher — DEBUG BUILD
+ * Writes every Photon event to debug.log so we can diagnose ENT=0.
+ * Share the log from inside the app via the Share Log button.
  */
 class EventDispatcher(private val logger: DiscoveryLogger) {
 
     companion object {
-        private const val TAG  = "EventDispatcher"
-        private const val DTAG = "GXDebug"  // debug tag — filter with adb logcat -s GXDebug
+        private const val TAG = "EventDispatcher"
 
         private const val EV_LEAVE       = 1
         private const val EV_HEARTBEAT   = 2
@@ -33,11 +28,6 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
         private const val EV_NEW_CHAR    = 24
         private const val EV_CHAT        = 60
 
-        // Rate-limit repetitive move events in debug log
-        private var moveLogCount  = 0
-        private var totalEvents   = 0
-        private var unknownCodes  = mutableSetOf<Int>()
-
         private val RES_KEYWORDS = mapOf(
             "WOOD"  to ResourceType.WOOD,
             "ROCK"  to ResourceType.ROCK,
@@ -45,8 +35,17 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
             "HIDE"  to ResourceType.HIDE,
             "ORE"   to ResourceType.ORE
         )
-        private val BOSS_WORDS     = listOf("BOSS", "MINIBOSS", "ASPECT", "KEEPER", "GUARDIAN", "SHRINE")
-        private val CHAMPION_WORDS = listOf("CHAMPION", "ELITE", "GROUP", "VETERAN")
+        private val BOSS_WORDS     = listOf("BOSS","MINIBOSS","ASPECT","KEEPER","GUARDIAN","SHRINE")
+        private val CHAMPION_WORDS = listOf("CHAMPION","ELITE","GROUP","VETERAN")
+
+        // Counters for summary
+        @Volatile var totalDispatched = 0
+        @Volatile var totalAdded      = 0
+        @Volatile var totalDropped    = 0
+        private val seenCodes = mutableSetOf<Int>()
+        private var moveCount  = 0
+        private var logCount   = 0
+        private const val MAX_LOG_LINES = 500  // stop writing after 500 lines to save space
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -56,47 +55,29 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
     fun dispatch(msg: PhotonMessage) {
         when (msg) {
             is PhotonMessage.Event -> {
-                totalEvents++
-                // Log first 200 events of every unique code we see
-                if (totalEvents <= 200 || msg.eventCode !in listOf(EV_HEARTBEAT, EV_MOVE, EV_CHAT)) {
-                    logEvent(msg)
-                }
+                totalDispatched++
                 handleEvent(msg)
             }
             is PhotonMessage.OperationResponse -> {
-                Log.d(DTAG, "[RESP] opCode=${msg.opCode} returnCode=${msg.returnCode} keys=${msg.parameters.keys}")
+                dbg("[RESP] opCode=${msg.opCode} retCode=${msg.returnCode} keys=${msg.parameters.keys.sorted()}")
             }
-            is PhotonMessage.OperationRequest -> {
-                Log.v(DTAG, "[REQ]  opCode=${msg.opCode} keys=${msg.parameters.keys}")
-            }
+            else -> Unit
         }
-    }
-
-    private fun logEvent(ev: PhotonMessage.Event) {
-        val p = ev.parameters
-        val sb = StringBuilder()
-        sb.append("[EVT] code=${ev.eventCode} keys=${p.keys.sorted()} | ")
-
-        // Log the type and value of every parameter
-        for (key in p.keys.sorted()) {
-            val v = p[key]
-            val typeName = v?.javaClass?.simpleName ?: "null"
-            val display = when (v) {
-                is ByteArray -> "ByteArray[${v.size}]=${v.take(16).map { it.toInt() and 0xFF }}"
-                is String    -> "\"$v\""
-                else         -> v.toString()
-            }
-            sb.append("$key($typeName)=$display  ")
-        }
-        Log.d(DTAG, sb.toString())
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Event routing
+    // Routing
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun handleEvent(ev: PhotonMessage.Event) {
-        when (ev.eventCode) {
+        val code = ev.eventCode
+
+        // Log every unique event code we see (once)
+        if (seenCodes.add(code)) {
+            dbg("[NEW CODE] $code  keys=${ev.parameters.keys.sorted()}  sample=${ev.parameters.entries.take(4).map { "${it.key}:${it.value?.javaClass?.simpleName}" }}")
+        }
+
+        when (code) {
             EV_HEARTBEAT, EV_CHAT -> Unit
             EV_NEW_ITEM,
             EV_NEW_HARVEST        -> handleResource(ev)
@@ -104,17 +85,12 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
             EV_NEW_CHAR           -> handlePlayer(ev)
             EV_MOVE               -> handleMove(ev)
             EV_LEAVE              -> handleLeave(ev)
-            else -> {
-                if (ev.eventCode !in unknownCodes) {
-                    unknownCodes.add(ev.eventCode)
-                    Log.w(DTAG, "[UNKNOWN CODE] ${ev.eventCode} — full params: ${ev.parameters}")
-                }
-            }
+            else -> dbg("[UNKNOWN] code=$code keys=${ev.parameters.keys.sorted()}")
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Resource spawn  — events 18 / 19
+    // Resource spawn
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun handleResource(ev: PhotonMessage.Event) {
@@ -128,34 +104,31 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
         val enchant  = p.pByte(11)?.toUByte()?.toInt() ?: 0
         val name     = p.pStr(17)
 
-        Log.i(DTAG, "[RESOURCE ev=${ev.eventCode}] entityId=$entityId typeId=$typeId " +
-            "posBytes=${posBytes?.size} posX=$posX posZ=$posZ tier=$tier enchant=$enchant name=$name")
+        dbg("[RES ev=${ev.eventCode}] id=$entityId tid=$typeId pb=${posBytes?.size} x=$posX z=$posZ t=$tier e=$enchant n=$name")
 
-        if (entityId == null) { Log.e(DTAG, "  ✗ DROPPED: entityId null"); return }
-        if (posX == null)     { Log.e(DTAG, "  ✗ DROPPED: posX null (posBytes=${posBytes?.size}, keys=${p.keys.sorted()})"); return }
-        if (posZ == null)     { Log.e(DTAG, "  ✗ DROPPED: posZ null"); return }
+        if (entityId == null) { dbg("  DROP: entityId=null"); totalDropped++; return }
+        if (posX     == null) { dbg("  DROP: posX=null  allKeys=${p.keys.sorted()}  pb=${posBytes?.take(20)}"); totalDropped++; return }
+        if (posZ     == null) { dbg("  DROP: posZ=null"); totalDropped++; return }
 
         val entity: RadarEntity? = when {
             name != null -> resourceFromName(entityId, name, posX, posZ).also {
-                if (it == null) Log.w(DTAG, "  ✗ resourceFromName returned null for name=$name")
-                else Log.i(DTAG, "  ✓ ADDED via name: tier=${it.tier} type=${it.resourceType} enchant=${it.enchantLevel}")
+                if (it == null) dbg("  DROP: name parse failed for '$name'")
             }
-            typeId > 0   -> {
+            typeId > 0 -> {
                 logger.logUnknownEntity(ev.eventCode, typeId, null, posX, posZ)
-                RadarEntity(
-                    entityId     = entityId,
-                    entityType   = EntityType.RESOURCE,
-                    posX         = posX,
-                    posZ         = posZ,
-                    typeId       = typeId,
-                    tier         = tier,
-                    enchantLevel = enchant
-                ).also { Log.i(DTAG, "  ✓ ADDED via typeId=$typeId (unknown name)") }
+                RadarEntity(entityId=entityId, entityType=EntityType.RESOURCE,
+                    posX=posX, posZ=posZ, typeId=typeId, tier=tier, enchantLevel=enchant)
             }
-            else -> null.also { Log.e(DTAG, "  ✗ DROPPED: no name and typeId <= 0") }
+            else -> null.also { dbg("  DROP: name=null and typeId=$typeId") }
         }
-        entity?.let { EntityStore.upsert(it) }
-        Log.d(DTAG, "  EntityStore size now: ${EntityStore.size()}")
+
+        if (entity != null) {
+            EntityStore.upsert(entity)
+            totalAdded++
+            dbg("  OK -> EntityStore=${EntityStore.size()}")
+        } else {
+            totalDropped++
+        }
     }
 
     private fun resourceFromName(id: Int, name: String, x: Float, z: Float): RadarEntity? {
@@ -163,26 +136,13 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
         val tier    = Regex("T(\\d)_").find(u)?.groupValues?.get(1)?.toIntOrNull()
         val enchant = Regex("LEVEL(\\d)").find(u)?.groupValues?.get(1)?.toIntOrNull() ?: 0
         val resType = RES_KEYWORDS.entries.firstOrNull { u.contains(it.key) }?.value
-
-        Log.v(DTAG, "  resourceFromName: name=$name tier=$tier resType=$resType enchant=$enchant")
-
-        if (tier == null) { Log.w(DTAG, "  ✗ no tier in name: $name"); return null }
-        if (resType == null) { Log.w(DTAG, "  ✗ no resType in name: $name"); return null }
-
-        return RadarEntity(
-            entityId     = id,
-            entityType   = EntityType.RESOURCE,
-            posX         = x,
-            posZ         = z,
-            uniqueName   = name,
-            tier         = tier,
-            enchantLevel = enchant,
-            resourceType = resType
-        )
+        if (tier == null || resType == null) return null
+        return RadarEntity(entityId=id, entityType=EntityType.RESOURCE,
+            posX=x, posZ=z, uniqueName=name, tier=tier, enchantLevel=enchant, resourceType=resType)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Mob spawn  — event 20
+    // Mob spawn
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun handleMob(ev: PhotonMessage.Event) {
@@ -195,43 +155,28 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
         val tier     = p.pByte(7)?.toUByte()?.toInt() ?: 0
         val name     = p.pStr(17)
 
-        Log.i(DTAG, "[MOB] entityId=$entityId typeId=$typeId posX=$posX posZ=$posZ tier=$tier name=$name")
+        dbg("[MOB] id=$entityId tid=$typeId x=$posX z=$posZ t=$tier n=$name")
 
-        if (entityId == null) { Log.e(DTAG, "  ✗ DROPPED: entityId null"); return }
-        if (posX == null)     { Log.e(DTAG, "  ✗ DROPPED: posX null (keys=${p.keys.sorted()})"); return }
-        if (posZ == null)     { Log.e(DTAG, "  ✗ DROPPED: posZ null"); return }
+        if (entityId == null) { dbg("  DROP: entityId=null"); totalDropped++; return }
+        if (posX     == null) { dbg("  DROP: posX=null  allKeys=${p.keys.sorted()}  pb=${posBytes?.take(20)}"); totalDropped++; return }
+        if (posZ     == null) { dbg("  DROP: posZ=null"); totalDropped++; return }
 
         if (name == null) logger.logUnknownEntity(ev.eventCode, typeId, null, posX, posZ)
 
+        val u = name?.uppercase() ?: ""
         val entityType = when {
-            name != null -> {
-                val u = name.uppercase()
-                when {
-                    BOSS_WORDS.any     { u.contains(it) } -> EntityType.MOB_BOSS
-                    CHAMPION_WORDS.any { u.contains(it) } -> EntityType.MOB_ENCHANTED
-                    else                                   -> EntityType.MOB_NORMAL
-                }
-            }
-            else -> EntityType.MOB_NORMAL
+            BOSS_WORDS.any     { u.contains(it) } -> EntityType.MOB_BOSS
+            CHAMPION_WORDS.any { u.contains(it) } -> EntityType.MOB_ENCHANTED
+            else                                   -> EntityType.MOB_NORMAL
         }
-
-        EntityStore.upsert(
-            RadarEntity(
-                entityId    = entityId,
-                entityType  = entityType,
-                posX        = posX,
-                posZ        = posZ,
-                typeId      = typeId,
-                uniqueName  = name,
-                tier        = tier,
-                displayName = name
-            )
-        )
-        Log.i(DTAG, "  ✓ MOB ADDED type=$entityType  EntityStore size=${EntityStore.size()}")
+        EntityStore.upsert(RadarEntity(entityId=entityId, entityType=entityType,
+            posX=posX, posZ=posZ, typeId=typeId, uniqueName=name, tier=tier, displayName=name))
+        totalAdded++
+        dbg("  OK $entityType -> EntityStore=${EntityStore.size()}")
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Player spawn  — event 24
+    // Player spawn
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun handlePlayer(ev: PhotonMessage.Event) {
@@ -243,32 +188,20 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
         val posZ     = posBytes?.leFloat(12) ?: p.pFloat(5)
         val faction  = p.pByte(11)?.toUByte()?.toInt() ?: 0
 
-        Log.i(DTAG, "[PLAYER] entityId=$entityId name=$name posX=$posX posZ=$posZ faction=$faction")
+        dbg("[PLAYER] id=$entityId name=$name x=$posX z=$posZ faction=$faction")
 
-        if (entityId == null) { Log.e(DTAG, "  ✗ DROPPED: entityId null"); return }
-        if (posX == null)     { Log.e(DTAG, "  ✗ DROPPED: posX null (posBytes=${posBytes?.size}, keys=${p.keys.sorted()})"); return }
-        if (posZ == null)     { Log.e(DTAG, "  ✗ DROPPED: posZ null"); return }
+        if (entityId == null) { dbg("  DROP: entityId=null"); totalDropped++; return }
+        if (posX     == null) { dbg("  DROP: posX=null  allKeys=${p.keys.sorted()}  pb=${posBytes?.size}"); totalDropped++; return }
+        if (posZ     == null) { dbg("  DROP: posZ=null"); totalDropped++; return }
 
-        val type = when (faction) {
-            255  -> EntityType.PLAYER_HOSTILE
-            1    -> EntityType.PLAYER_FACTION
-            else -> EntityType.PLAYER_PASSIVE
-        }
-
-        EntityStore.upsert(
-            RadarEntity(
-                entityId    = entityId,
-                entityType  = type,
-                posX        = posX,
-                posZ        = posZ,
-                displayName = name
-            )
-        )
-        Log.i(DTAG, "  ✓ PLAYER ADDED $name type=$type  EntityStore size=${EntityStore.size()}")
+        val type = when (faction) { 255 -> EntityType.PLAYER_HOSTILE; 1 -> EntityType.PLAYER_FACTION; else -> EntityType.PLAYER_PASSIVE }
+        EntityStore.upsert(RadarEntity(entityId=entityId, entityType=type, posX=posX, posZ=posZ, displayName=name))
+        totalAdded++
+        dbg("  OK $name $type -> EntityStore=${EntityStore.size()}")
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Move  — event 3
+    // Move
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun handleMove(ev: PhotonMessage.Event) {
@@ -278,19 +211,29 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
         val posX     = posBytes?.leFloat(0) ?: p.pFloat(2) ?: return
         val posZ     = posBytes?.leFloat(4) ?: p.pFloat(3) ?: return
         EntityStore.updatePosition(entityId, posX, posZ)
-        if (moveLogCount++ < 5) {
-            Log.v(DTAG, "[MOVE] entityId=$entityId posX=$posX posZ=$posZ")
-        }
+        if (moveCount++ < 3) dbg("[MOVE] id=$entityId x=$posX z=$posZ")
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Leave  — event 1
+    // Leave
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun handleLeave(ev: PhotonMessage.Event) {
         val id = ev.parameters.pInt(0) ?: return
         EntityStore.remove(id)
-        Log.v(DTAG, "[LEAVE] removed entityId=$id  size=${EntityStore.size()}")
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Debug writer — stops after MAX_LOG_LINES to avoid filling storage
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private fun dbg(line: String) {
+        Log.d(TAG, line)
+        if (logCount++ < MAX_LOG_LINES) {
+            logger.writeDebug(line)
+        } else if (logCount == MAX_LOG_LINES + 1) {
+            logger.writeDebug("--- log limit reached: dispatched=$totalDispatched added=$totalAdded dropped=$totalDropped seenCodes=$seenCodes ---")
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -328,16 +271,14 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
             else      -> null
         }
 
-    private fun Map<Int, Any?>.pStr(key: Int): String? =
-        this[key] as? String
+    private fun Map<Int, Any?>.pStr(key: Int): String? = this[key] as? String
 
-    private fun Map<Int, Any?>.pBytes(key: Int): ByteArray? =
-        this[key] as? ByteArray
+    private fun Map<Int, Any?>.pBytes(key: Int): ByteArray? = this[key] as? ByteArray
 
     private fun ByteArray.leFloat(offset: Int): Float? {
         if (offset + 4 > this.size) return null
-        return ByteBuffer.wrap(this, offset, 4)
-            .order(ByteOrder.LITTLE_ENDIAN)
-            .float
+        return ByteBuffer.wrap(this, offset, 4).order(ByteOrder.LITTLE_ENDIAN).float
     }
+
+    private fun ByteArray.take(n: Int) = this.toList().take(n).map { it.toInt() and 0xFF }
 }
