@@ -10,23 +10,19 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * EventDispatcher — translates Photon messages → EntityStore mutations.
+ * EventDispatcher — DEBUG VERSION
  *
- * Resolution priority per event:
- *   Plan C → parse uniqueName string  "T4_WOOD_LEVEL2"
- *   Plan A → SQLite DB lookup by typeId  (wired in Step 3)
- *   Plan B → Discovery Logger (unknown entities → log file)
+ * Logs EVERY incoming Photon event so we can diagnose why ENT stays 0.
+ * Tag: GXDebug
  *
- * Albion event codes live in params[252], NOT the Photon envelope code.
- *
- *   1  Leave            2  Heartbeat (drop)   3  Move
- *   18 NewSimpleItem    19 NewSimpleHarvestable
- *   20 NewMob           24 NewCharacter        60 Chat (drop)
+ * To view logs:
+ *   adb logcat -s GXDebug:V *:S
  */
 class EventDispatcher(private val logger: DiscoveryLogger) {
 
     companion object {
-        private const val TAG = "EventDispatcher"
+        private const val TAG  = "EventDispatcher"
+        private const val DTAG = "GXDebug"  // debug tag — filter with adb logcat -s GXDebug
 
         private const val EV_LEAVE       = 1
         private const val EV_HEARTBEAT   = 2
@@ -36,6 +32,11 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
         private const val EV_NEW_MOB     = 20
         private const val EV_NEW_CHAR    = 24
         private const val EV_CHAT        = 60
+
+        // Rate-limit repetitive move events in debug log
+        private var moveLogCount  = 0
+        private var totalEvents   = 0
+        private var unknownCodes  = mutableSetOf<Int>()
 
         private val RES_KEYWORDS = mapOf(
             "WOOD"  to ResourceType.WOOD,
@@ -53,7 +54,41 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
     // ─────────────────────────────────────────────────────────────────────────
 
     fun dispatch(msg: PhotonMessage) {
-        if (msg is PhotonMessage.Event) handleEvent(msg)
+        when (msg) {
+            is PhotonMessage.Event -> {
+                totalEvents++
+                // Log first 200 events of every unique code we see
+                if (totalEvents <= 200 || msg.eventCode !in listOf(EV_HEARTBEAT, EV_MOVE, EV_CHAT)) {
+                    logEvent(msg)
+                }
+                handleEvent(msg)
+            }
+            is PhotonMessage.OperationResponse -> {
+                Log.d(DTAG, "[RESP] opCode=${msg.opCode} returnCode=${msg.returnCode} keys=${msg.parameters.keys}")
+            }
+            is PhotonMessage.OperationRequest -> {
+                Log.v(DTAG, "[REQ]  opCode=${msg.opCode} keys=${msg.parameters.keys}")
+            }
+        }
+    }
+
+    private fun logEvent(ev: PhotonMessage.Event) {
+        val p = ev.parameters
+        val sb = StringBuilder()
+        sb.append("[EVT] code=${ev.eventCode} keys=${p.keys.sorted()} | ")
+
+        // Log the type and value of every parameter
+        for (key in p.keys.sorted()) {
+            val v = p[key]
+            val typeName = v?.javaClass?.simpleName ?: "null"
+            val display = when (v) {
+                is ByteArray -> "ByteArray[${v.size}]=${v.take(16).map { it.toInt() and 0xFF }}"
+                is String    -> "\"$v\""
+                else         -> v.toString()
+            }
+            sb.append("$key($typeName)=$display  ")
+        }
+        Log.d(DTAG, sb.toString())
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -69,29 +104,42 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
             EV_NEW_CHAR           -> handlePlayer(ev)
             EV_MOVE               -> handleMove(ev)
             EV_LEAVE              -> handleLeave(ev)
-            else -> Log.v(TAG, "ev ${ev.eventCode} keys=${ev.parameters.keys}")
+            else -> {
+                if (ev.eventCode !in unknownCodes) {
+                    unknownCodes.add(ev.eventCode)
+                    Log.w(DTAG, "[UNKNOWN CODE] ${ev.eventCode} — full params: ${ev.parameters}")
+                }
+            }
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Resource spawn  — events 18 / 19
-    // params: 0=entityId(int)  1=typeId(short)  2=posBytes
-    //         7=tier(byte)  11=enchant(byte)  17=uniqueName(string, optional)
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun handleResource(ev: PhotonMessage.Event) {
         val p        = ev.parameters
-        val entityId = p.pInt(0)             ?: return
-        val typeId   = p.pShort(1)?.toInt()  ?: -1      // FIX: Short → Int
+        val entityId = p.pInt(0)
+        val typeId   = p.pShort(1)?.toInt() ?: -1
         val posBytes = p.pBytes(2)
-        val posX     = posBytes?.leFloat(8)  ?: p.pFloat(4) ?: return
-        val posZ     = posBytes?.leFloat(12) ?: p.pFloat(5) ?: return
+        val posX     = posBytes?.leFloat(8)  ?: p.pFloat(4)
+        val posZ     = posBytes?.leFloat(12) ?: p.pFloat(5)
         val tier     = p.pByte(7)?.toUByte()?.toInt()  ?: 0
         val enchant  = p.pByte(11)?.toUByte()?.toInt() ?: 0
         val name     = p.pStr(17)
 
+        Log.i(DTAG, "[RESOURCE ev=${ev.eventCode}] entityId=$entityId typeId=$typeId " +
+            "posBytes=${posBytes?.size} posX=$posX posZ=$posZ tier=$tier enchant=$enchant name=$name")
+
+        if (entityId == null) { Log.e(DTAG, "  ✗ DROPPED: entityId null"); return }
+        if (posX == null)     { Log.e(DTAG, "  ✗ DROPPED: posX null (posBytes=${posBytes?.size}, keys=${p.keys.sorted()})"); return }
+        if (posZ == null)     { Log.e(DTAG, "  ✗ DROPPED: posZ null"); return }
+
         val entity: RadarEntity? = when {
-            name != null -> resourceFromName(entityId, name, posX, posZ)
+            name != null -> resourceFromName(entityId, name, posX, posZ).also {
+                if (it == null) Log.w(DTAG, "  ✗ resourceFromName returned null for name=$name")
+                else Log.i(DTAG, "  ✓ ADDED via name: tier=${it.tier} type=${it.resourceType} enchant=${it.enchantLevel}")
+            }
             typeId > 0   -> {
                 logger.logUnknownEntity(ev.eventCode, typeId, null, posX, posZ)
                 RadarEntity(
@@ -99,22 +147,28 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
                     entityType   = EntityType.RESOURCE,
                     posX         = posX,
                     posZ         = posZ,
-                    typeId       = typeId,   // now Int — no mismatch
+                    typeId       = typeId,
                     tier         = tier,
                     enchantLevel = enchant
-                )
+                ).also { Log.i(DTAG, "  ✓ ADDED via typeId=$typeId (unknown name)") }
             }
-            else -> null
+            else -> null.also { Log.e(DTAG, "  ✗ DROPPED: no name and typeId <= 0") }
         }
         entity?.let { EntityStore.upsert(it) }
+        Log.d(DTAG, "  EntityStore size now: ${EntityStore.size()}")
     }
 
     private fun resourceFromName(id: Int, name: String, x: Float, z: Float): RadarEntity? {
         val u       = name.uppercase()
-        val tier    = Regex("T(\\d)_").find(u)?.groupValues?.get(1)?.toIntOrNull() ?: return null
+        val tier    = Regex("T(\\d)_").find(u)?.groupValues?.get(1)?.toIntOrNull()
         val enchant = Regex("LEVEL(\\d)").find(u)?.groupValues?.get(1)?.toIntOrNull() ?: 0
         val resType = RES_KEYWORDS.entries.firstOrNull { u.contains(it.key) }?.value
-            ?: return null
+
+        Log.v(DTAG, "  resourceFromName: name=$name tier=$tier resType=$resType enchant=$enchant")
+
+        if (tier == null) { Log.w(DTAG, "  ✗ no tier in name: $name"); return null }
+        if (resType == null) { Log.w(DTAG, "  ✗ no resType in name: $name"); return null }
+
         return RadarEntity(
             entityId     = id,
             entityType   = EntityType.RESOURCE,
@@ -129,18 +183,23 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
 
     // ─────────────────────────────────────────────────────────────────────────
     // Mob spawn  — event 20
-    // params: 0=entityId  1=typeId(short)  2=posBytes  7=tier  17=uniqueName
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun handleMob(ev: PhotonMessage.Event) {
         val p        = ev.parameters
-        val entityId = p.pInt(0)            ?: return
-        val typeId   = p.pShort(1)?.toInt() ?: -1      // FIX: Short → Int
+        val entityId = p.pInt(0)
+        val typeId   = p.pShort(1)?.toInt() ?: -1
         val posBytes = p.pBytes(2)
-        val posX     = posBytes?.leFloat(8)  ?: p.pFloat(4) ?: return
-        val posZ     = posBytes?.leFloat(12) ?: p.pFloat(5) ?: return
+        val posX     = posBytes?.leFloat(8)  ?: p.pFloat(4)
+        val posZ     = posBytes?.leFloat(12) ?: p.pFloat(5)
         val tier     = p.pByte(7)?.toUByte()?.toInt() ?: 0
         val name     = p.pStr(17)
+
+        Log.i(DTAG, "[MOB] entityId=$entityId typeId=$typeId posX=$posX posZ=$posZ tier=$tier name=$name")
+
+        if (entityId == null) { Log.e(DTAG, "  ✗ DROPPED: entityId null"); return }
+        if (posX == null)     { Log.e(DTAG, "  ✗ DROPPED: posX null (keys=${p.keys.sorted()})"); return }
+        if (posZ == null)     { Log.e(DTAG, "  ✗ DROPPED: posZ null"); return }
 
         if (name == null) logger.logUnknownEntity(ev.eventCode, typeId, null, posX, posZ)
 
@@ -162,27 +221,33 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
                 entityType  = entityType,
                 posX        = posX,
                 posZ        = posZ,
-                typeId      = typeId,    // now Int — no mismatch
+                typeId      = typeId,
                 uniqueName  = name,
                 tier        = tier,
                 displayName = name
             )
         )
+        Log.i(DTAG, "  ✓ MOB ADDED type=$entityType  EntityStore size=${EntityStore.size()}")
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Player spawn  — event 24
-    // params: 0=entityId  1=name(String)  2=posBytes  11=factionFlags
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun handlePlayer(ev: PhotonMessage.Event) {
         val p        = ev.parameters
-        val entityId = p.pInt(0) ?: return
+        val entityId = p.pInt(0)
         val name     = p.pStr(1) ?: "?"
         val posBytes = p.pBytes(2)
-        val posX     = posBytes?.leFloat(8)  ?: p.pFloat(4) ?: return
-        val posZ     = posBytes?.leFloat(12) ?: p.pFloat(5) ?: return
+        val posX     = posBytes?.leFloat(8)  ?: p.pFloat(4)
+        val posZ     = posBytes?.leFloat(12) ?: p.pFloat(5)
         val faction  = p.pByte(11)?.toUByte()?.toInt() ?: 0
+
+        Log.i(DTAG, "[PLAYER] entityId=$entityId name=$name posX=$posX posZ=$posZ faction=$faction")
+
+        if (entityId == null) { Log.e(DTAG, "  ✗ DROPPED: entityId null"); return }
+        if (posX == null)     { Log.e(DTAG, "  ✗ DROPPED: posX null (posBytes=${posBytes?.size}, keys=${p.keys.sorted()})"); return }
+        if (posZ == null)     { Log.e(DTAG, "  ✗ DROPPED: posZ null"); return }
 
         val type = when (faction) {
             255  -> EntityType.PLAYER_HOSTILE
@@ -199,12 +264,11 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
                 displayName = name
             )
         )
+        Log.i(DTAG, "  ✓ PLAYER ADDED $name type=$type  EntityStore size=${EntityStore.size()}")
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Move  — event 3
-    // params: 0=entityId  1=posBytes (LE float at [0] and [4])
-    //   OR    0=entityId  2=posX(float)  3=posZ(float)
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun handleMove(ev: PhotonMessage.Event) {
@@ -214,19 +278,23 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
         val posX     = posBytes?.leFloat(0) ?: p.pFloat(2) ?: return
         val posZ     = posBytes?.leFloat(4) ?: p.pFloat(3) ?: return
         EntityStore.updatePosition(entityId, posX, posZ)
+        if (moveLogCount++ < 5) {
+            Log.v(DTAG, "[MOVE] entityId=$entityId posX=$posX posZ=$posZ")
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Leave / despawn  — event 1
+    // Leave  — event 1
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun handleLeave(ev: PhotonMessage.Event) {
         val id = ev.parameters.pInt(0) ?: return
         EntityStore.remove(id)
+        Log.v(DTAG, "[LEAVE] removed entityId=$id  size=${EntityStore.size()}")
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Extension helpers — type-safe param extraction
+    // Extension helpers
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun Map<Int, Any?>.pInt(key: Int): Int? =
@@ -266,10 +334,6 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
     private fun Map<Int, Any?>.pBytes(key: Int): ByteArray? =
         this[key] as? ByteArray
 
-    /**
-     * Extract a Little-Endian float from a ByteArray at [offset].
-     * Position data in Albion packets is always LE, NOT BE.
-     */
     private fun ByteArray.leFloat(offset: Int): Float? {
         if (offset + 4 > this.size) return null
         return ByteBuffer.wrap(this, offset, 4)
