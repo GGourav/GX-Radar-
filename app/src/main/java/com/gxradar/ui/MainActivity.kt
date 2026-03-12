@@ -11,10 +11,12 @@ import android.provider.Settings
 import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.gxradar.R
 import com.gxradar.databinding.ActivityMainBinding
 import com.gxradar.network.AlbionVpnService
+import com.gxradar.overlay.RadarOverlayService
 
 class MainActivity : AppCompatActivity() {
 
@@ -23,8 +25,8 @@ class MainActivity : AppCompatActivity() {
     private val vpnLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        if (result.resultCode == RESULT_OK) startVpnService()
-        else toast("VPN permission denied — radar cannot capture packets")
+        if (result.resultCode == RESULT_OK) startServices()
+        else toast("VPN permission denied")
     }
 
     private val notifLauncher = registerForActivityResult(
@@ -41,7 +43,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.btnToggle.setOnClickListener {
-            if (isVpnRunning()) stopServices() else checkAndStart()
+            if (isRunning()) stopServices() else checkAndStart()
         }
         binding.btnOverlayPerm.setOnClickListener { openOverlaySettings() }
     }
@@ -52,9 +54,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshUi() {
-        val running = isVpnRunning()
+        val running = isRunning()
         binding.btnToggle.text = if (running) "Stop Radar" else "Start Radar"
-        binding.tvStatus.text  = if (running) "\u25CF ACTIVE \u2014 capturing port 5056" else "\u25CB STOPPED"
+        binding.tvStatus.text  = if (running) "\u25CF ACTIVE" else "\u25CB STOPPED"
         binding.tvStatus.setTextColor(
             getColor(if (running) R.color.status_on else R.color.status_off)
         )
@@ -63,9 +65,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun checkAndStart() {
+        if (!Settings.canDrawOverlays(this)) {
+            AlertDialog.Builder(this)
+                .setTitle("Overlay Permission Required")
+                .setMessage("GX Radar needs to draw over other apps.\n\n1. Tap Open Settings\n2. Enable 'Allow display over other apps'\n3. Return here and tap Start")
+                .setPositiveButton("Open Settings") { _, _ -> openOverlaySettings() }
+                .setNegativeButton("Skip for now") { _, _ ->
+                    // Start VPN only — no HUD until permission granted
+                    val vpnIntent = VpnService.prepare(this)
+                    if (vpnIntent != null) vpnLauncher.launch(vpnIntent)
+                    else startServices()
+                }
+                .show()
+            return
+        }
         val vpnIntent = VpnService.prepare(this)
         if (vpnIntent != null) vpnLauncher.launch(vpnIntent)
-        else startVpnService()
+        else startServices()
     }
 
     private fun openOverlaySettings() {
@@ -77,29 +93,37 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    private fun startVpnService() {
+    private fun startServices() {
         try {
+            // Start VPN capture
             startForegroundService(
                 Intent(this, AlbionVpnService::class.java)
                     .setAction(AlbionVpnService.ACTION_START)
             )
+            // Start HUD overlay (shows packet counts)
+            if (Settings.canDrawOverlays(this)) {
+                startForegroundService(
+                    Intent(this, RadarOverlayService::class.java)
+                        .setAction(RadarOverlayService.ACTION_START)
+                )
+            }
             refreshUi()
-            toast("GX Radar started \u2014 listening on port 5056")
+            toast("GX Radar started")
         } catch (e: Exception) {
-            toast("Failed to start: ${e.message}")
+            toast("Start failed: ${e.message}")
         }
     }
 
     private fun stopServices() {
-        sendBroadcast(
-            Intent(AlbionVpnService.ACTION_STOP).setPackage(packageName)
-        )
+        // Direct stopService() — reliable on all Android versions
+        stopService(Intent(this, AlbionVpnService::class.java))
+        stopService(Intent(this, RadarOverlayService::class.java))
         refreshUi()
         toast("GX Radar stopped")
     }
 
     @Suppress("DEPRECATION")
-    private fun isVpnRunning(): Boolean {
+    private fun isRunning(): Boolean {
         val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         return am.getRunningServices(Int.MAX_VALUE).any {
             it.service.className == AlbionVpnService::class.java.name
