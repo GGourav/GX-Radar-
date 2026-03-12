@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Allows sharing files from app's internal cache directory -->
+    <cache-path name="cache" path="." />
+    <!-- Allows sharing files from external app files dir -->
+    <external-files-path name="external_files" path="." />
+</paths>
