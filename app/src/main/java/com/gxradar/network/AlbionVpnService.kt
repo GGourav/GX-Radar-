@@ -1,6 +1,7 @@
 package com.gxradar.network
 
 import android.app.NotificationManager
+import android.content.Intent
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import android.util.Log
@@ -18,21 +19,15 @@ import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
-import android.content.Intent
 
 /**
- * AlbionVpnService — complete rewrite.
+ * AlbionVpnService
  *
- * KEY FACTS from APK reverse engineering:
- *  1. addAllowedApplication("com.albiononline") — ONLY Albion enters TUN
- *     → All other apps bypass VPN completely → internet works normally
- *  2. Stop via stopService() from Activity — no broadcast needed
- *  3. UDP proxy: read TUN → parse Photon → forward to server → write response back to TUN
+ * KEY: addAllowedApplication("com.albiononline")
+ *   Only Albion's UDP traffic enters TUN — all other apps bypass completely.
+ *   This is why internet works normally while radar captures packets.
  *
- * Why previous versions crashed on Start:
- *  - foregroundServiceType="specialUse" in manifest → SecurityException on most devices
- *  - lateinit dispatcher accessed before init → UninitializedPropertyAccessException
- *  - Both fixed here.
+ * Stop: MainActivity calls stopService() directly — no broadcast needed.
  */
 class AlbionVpnService : VpnService() {
 
@@ -46,30 +41,30 @@ class AlbionVpnService : VpnService() {
         private const val TUN_IP    = "10.8.0.2"
         private const val TUN_MASK  = 32
 
-        val packetCount  = AtomicLong(0)
-        val albionCount  = AtomicLong(0)
+        val packetCount = AtomicLong(0)
+        val albionCount = AtomicLong(0)
     }
 
-    // Nullable — safe even if init fails
     private var dispatcher:      EventDispatcher?      = null
     private var discoveryLogger: DiscoveryLogger?      = null
     private var tunPfd:          ParcelFileDescriptor? = null
 
     private val scope      = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    // sessionId -> protected outbound socket
     private val udpSockets = ConcurrentHashMap<String, DatagramSocket>()
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
-        // Safe init — if storage fails, logger stays null, dispatcher uses null logger
-        runCatching { discoveryLogger = DiscoveryLogger(this) }
-        runCatching { dispatcher      = EventDispatcher(discoveryLogger!!) }
-            .onFailure {
-                // Make dispatcher work even without logger
-                runCatching { dispatcher = object : EventDispatcher(DiscoveryLogger(this)) {} }
-            }
+        // Safe init — storage errors must not crash the service
+        val ctx = this
+        runCatching { discoveryLogger = DiscoveryLogger(ctx) }
+        val logger = discoveryLogger
+        if (logger != null) {
+            runCatching { dispatcher = EventDispatcher(logger) }
+        }
+        // If logger init failed, dispatcher stays null — packets are captured
+        // but entities won't be stored until a zone is entered again after fix.
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -79,7 +74,7 @@ class AlbionVpnService : VpnService() {
             catch (e: CancellationException) { /* normal stop */ }
             catch (e: Exception) { Log.e(TAG, "capture error: ${e.message}") }
         }
-        return START_NOT_STICKY  // Don't auto-restart — prevents flooding
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
@@ -108,7 +103,7 @@ class AlbionVpnService : VpnService() {
                 .addDnsServer("8.8.4.4")
                 .setMtu(MTU)
                 .setBlocking(true)
-                .addAllowedApplication(ALBION_PACKAGE)  // ★ ONLY Albion enters TUN
+                .addAllowedApplication(ALBION_PACKAGE)
                 .establish()
         } catch (e: Exception) {
             Log.e(TAG, "TUN establish failed: ${e.message}")
@@ -137,80 +132,66 @@ class AlbionVpnService : VpnService() {
             if ((inBuf[0].toInt() and 0xF0) != 0x40) continue
             val ihl      = (inBuf[0].toInt() and 0x0F) * 4
             val protocol = inBuf[9].toInt() and 0xFF
-            if (protocol != 17 || len < ihl + 8) continue  // UDP only
+            if (protocol != 17 || len < ihl + 8) continue
 
-            val dstPort = inBuf.u16(ihl + 2)
             val srcPort = inBuf.u16(ihl)
+            val dstPort = inBuf.u16(ihl + 2)
             val payOff  = ihl + 8
             val payLen  = len - payOff
             if (payLen <= 0) continue
 
-            // ── Parse Photon if Albion game port ──────────────────────────────
+            // Parse Photon if Albion port
             if (dstPort == ALBION_PORT || srcPort == ALBION_PORT) {
                 albionCount.incrementAndGet()
                 try {
                     val payload = inBuf.copyOfRange(payOff, payOff + payLen)
-                    val messages = PhotonParser.parse(payload)
-                    messages.forEach { dispatcher?.dispatch(it) }
-                    if (messages.isNotEmpty() && albionCount.get() % 50 == 0L) updateNotif()
+                    PhotonParser.parse(payload).forEach { dispatcher?.dispatch(it) }
+                    if (albionCount.get() % 50 == 0L) updateNotif()
                 } catch (e: Exception) {
                     Log.v(TAG, "photon: ${e.message}")
                 }
             }
 
-            // ── Forward UDP via protected socket ──────────────────────────────
-            // Extract destination IP and forward
+            // Forward UDP via protected socket
             try {
                 val dstIpBytes = inBuf.copyOfRange(16, 20)
                 val dstIp      = InetAddress.getByAddress(dstIpBytes)
                 val key        = "$srcPort:${dstIp.hostAddress}:$dstPort"
 
                 val sock = udpSockets.getOrPut(key) {
-                    DatagramSocket().also { s ->
-                        if (!protect(s)) {
-                            s.close()
-                            Log.w(TAG, "protect() failed")
-                        }
-                    }
+                    DatagramSocket().also { s -> protect(s) }
                 }
 
-                // Send outbound
                 sock.send(DatagramPacket(inBuf, payOff, payLen, dstIp, dstPort))
 
-                // Receive response (non-blocking check)
+                // Check for response (non-blocking)
                 sock.soTimeout = 1
                 val respBuf = ByteArray(MTU)
                 val respPkt = DatagramPacket(respBuf, respBuf.size)
                 try {
                     sock.receive(respPkt)
-                    // Write response back into TUN as inbound IP packet
+                    val srcIpInt = ByteBuffer.wrap(inBuf).getInt(12)
+                    val localIp  = ByteArray(4).also {
+                        it[0] = (srcIpInt shr 24).toByte()
+                        it[1] = (srcIpInt shr 16).toByte()
+                        it[2] = (srcIpInt shr 8).toByte()
+                        it[3] = srcIpInt.toByte()
+                    }
                     val response = buildIpPacket(
                         srcIp   = dstIpBytes,
-                        dstIp   = ByteArray(4).also {
-                            ByteBuffer.wrap(inBuf).getInt(12).let { ipInt ->
-                                it[0] = (ipInt shr 24).toByte()
-                                it[1] = (ipInt shr 16).toByte()
-                                it[2] = (ipInt shr 8).toByte()
-                                it[3] = ipInt.toByte()
-                            }
-                        },
+                        dstIp   = localIp,
                         srcPort = dstPort,
                         dstPort = srcPort,
                         payload = respBuf,
                         payLen  = respPkt.length
                     )
                     if (response != null) tunOut.write(response)
-                } catch (e: java.net.SocketTimeoutException) {
-                    // No response yet — normal for UDP
-                }
+                } catch (_: java.net.SocketTimeoutException) { }
             } catch (e: Exception) {
-                // Remove broken socket, will recreate next time
-                udpSockets.remove(inBuf.u16(ihl).toString())?.runCatching { close() }
+                udpSockets.remove("$srcPort")?.runCatching { close() }
             }
         }
     }
-
-    // ── Build inbound IP+UDP packet to write back into TUN ────────────────────
 
     private fun buildIpPacket(
         srcIp: ByteArray, dstIp: ByteArray,
@@ -222,31 +203,16 @@ class AlbionVpnService : VpnService() {
         val totalLen = 20 + udpLen
         val pkt      = ByteArray(totalLen)
         val bb       = ByteBuffer.wrap(pkt)
-
-        // IP header
-        bb.put(0x45.toByte())           // Version=4, IHL=5
-        bb.put(0)
-        bb.putShort(totalLen.toShort()) // Total length
-        bb.putShort(0)                  // ID
-        bb.putShort(0x4000.toShort())   // Don't fragment
-        bb.put(64)                      // TTL
-        bb.put(17)                      // Protocol=UDP
-        bb.putShort(0)                  // Checksum (skip)
-        bb.put(srcIp)                   // Source IP
-        bb.put(dstIp)                   // Dest IP
-
-        // UDP header
-        bb.putShort(srcPort.toShort())
-        bb.putShort(dstPort.toShort())
-        bb.putShort(udpLen.toShort())
-        bb.putShort(0)                  // UDP checksum (skip)
-
-        // Payload
+        bb.put(0x45.toByte()); bb.put(0)
+        bb.putShort(totalLen.toShort())
+        bb.putShort(0); bb.putShort(0x4000.toShort())
+        bb.put(64); bb.put(17); bb.putShort(0)
+        bb.put(srcIp); bb.put(dstIp)
+        bb.putShort(srcPort.toShort()); bb.putShort(dstPort.toShort())
+        bb.putShort(udpLen.toShort()); bb.putShort(0)
         bb.put(payload, 0, payLen)
         return pkt
     }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun ByteArray.u16(off: Int): Int =
         ((this[off].toInt() and 0xFF) shl 8) or (this[off + 1].toInt() and 0xFF)
@@ -256,8 +222,7 @@ class AlbionVpnService : VpnService() {
             .setContentTitle("GX Radar")
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_radar_notif)
-            .setOngoing(true)
-            .setSilent(true)
+            .setOngoing(true).setSilent(true)
             .build()
 
     private fun notify(text: String) {
