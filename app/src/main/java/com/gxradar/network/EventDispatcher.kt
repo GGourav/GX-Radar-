@@ -44,8 +44,8 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
             "HIDE"  to ResourceType.HIDE,
             "ORE"   to ResourceType.ORE
         )
-        private val BOSS_WORDS     = listOf("BOSS","MINIBOSS","ASPECT","KEEPER","GUARDIAN","SHRINE")
-        private val CHAMPION_WORDS = listOf("CHAMPION","ELITE","GROUP","VETERAN")
+        private val BOSS_WORDS     = listOf("BOSS", "MINIBOSS", "ASPECT", "KEEPER", "GUARDIAN", "SHRINE")
+        private val CHAMPION_WORDS = listOf("CHAMPION", "ELITE", "GROUP", "VETERAN")
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -81,8 +81,8 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
 
     private fun handleResource(ev: PhotonMessage.Event) {
         val p        = ev.parameters
-        val entityId = p.pInt(0)   ?: return
-        val typeId   = p.pShort(1) ?: -1
+        val entityId = p.pInt(0)             ?: return
+        val typeId   = p.pShort(1)?.toInt()  ?: -1      // FIX: Short → Int
         val posBytes = p.pBytes(2)
         val posX     = posBytes?.leFloat(8)  ?: p.pFloat(4) ?: return
         val posZ     = posBytes?.leFloat(12) ?: p.pFloat(5) ?: return
@@ -99,7 +99,7 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
                     entityType   = EntityType.RESOURCE,
                     posX         = posX,
                     posZ         = posZ,
-                    typeId       = typeId,
+                    typeId       = typeId,   // now Int — no mismatch
                     tier         = tier,
                     enchantLevel = enchant
                 )
@@ -110,8 +110,8 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
     }
 
     private fun resourceFromName(id: Int, name: String, x: Float, z: Float): RadarEntity? {
-        val u = name.uppercase()
-        val tier = Regex("T(\\d)_").find(u)?.groupValues?.get(1)?.toIntOrNull() ?: return null
+        val u       = name.uppercase()
+        val tier    = Regex("T(\\d)_").find(u)?.groupValues?.get(1)?.toIntOrNull() ?: return null
         val enchant = Regex("LEVEL(\\d)").find(u)?.groupValues?.get(1)?.toIntOrNull() ?: 0
         val resType = RES_KEYWORDS.entries.firstOrNull { u.contains(it.key) }?.value
             ?: return null
@@ -129,13 +129,13 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
 
     // ─────────────────────────────────────────────────────────────────────────
     // Mob spawn  — event 20
-    // params: 0=entityId  1=typeId  2=posBytes  7=tier  17=uniqueName
+    // params: 0=entityId  1=typeId(short)  2=posBytes  7=tier  17=uniqueName
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun handleMob(ev: PhotonMessage.Event) {
         val p        = ev.parameters
-        val entityId = p.pInt(0)   ?: return
-        val typeId   = p.pShort(1) ?: -1
+        val entityId = p.pInt(0)            ?: return
+        val typeId   = p.pShort(1)?.toInt() ?: -1      // FIX: Short → Int
         val posBytes = p.pBytes(2)
         val posX     = posBytes?.leFloat(8)  ?: p.pFloat(4) ?: return
         val posZ     = posBytes?.leFloat(12) ?: p.pFloat(5) ?: return
@@ -162,7 +162,7 @@ class EventDispatcher(private val logger: DiscoveryLogger) {
                 entityType  = entityType,
                 posX        = posX,
                 posZ        = posZ,
-                typeId      = typeId,
+                typeId      = typeId,    // now Int — no mismatch
                 uniqueName  = name,
                 tier        = tier,
                 displayName = name
