@@ -1,5 +1,7 @@
 package com.gxradar.ui
 
+import android.app.NotificationManager
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.net.VpnService
@@ -26,31 +28,25 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private var discoveryLogger: DiscoveryLogger? = null
 
-    // Auto-refresh status every 2 seconds while app is open
     private val handler  = Handler(Looper.getMainLooper())
     private val ticker   = object : Runnable {
-        override fun run() {
-            refreshUi()
-            handler.postDelayed(this, 2000)
-        }
+        override fun run() { refreshUi(); handler.postDelayed(this, 2000) }
     }
 
     private val vpnLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == RESULT_OK) startServices()
-        else toast("VPN permission denied")
-    }
+    ) { if (it.resultCode == RESULT_OK) startServices() else toast("VPN permission denied") }
 
     private val notifLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* non-critical */ }
+    ) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        // Safe — storage errors must not crash the Activity
         runCatching { discoveryLogger = DiscoveryLogger(this) }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -75,75 +71,57 @@ class MainActivity : AppCompatActivity() {
         handler.removeCallbacks(ticker)
     }
 
-    // ── UI ────────────────────────────────────────────────────────────────────
-
     private fun refreshUi() {
         val running = isRunning()
         binding.btnToggle.text = if (running) "Stop Radar" else "Start Radar"
-
         val ent   = EntityStore.size()
         val logKb = discoveryLogger?.getDebugSizeKb() ?: 0
         val disp  = EventDispatcher.totalDispatched
         val added = EventDispatcher.totalAdded
         val drop  = EventDispatcher.totalDropped
-
         binding.tvStatus.text = if (running)
-            "● ACTIVE\nENT=$ent  DISP=$disp  ADD=$added  DROP=$drop\nLOG=${logKb}KB"
+            "\u25CF ACTIVE  ENT=$ent  DISP=$disp  ADD=$added  DROP=$drop  LOG=${logKb}KB"
         else
-            "○ STOPPED  last: ENT=$ent  LOG=${logKb}KB"
-
+            "\u25CB STOPPED  ENT=$ent  LOG=${logKb}KB"
         binding.tvStatus.setTextColor(
             getColor(if (running) R.color.status_on else R.color.status_off)
         )
         binding.btnOverlayPerm.visibility =
             if (Settings.canDrawOverlays(this)) View.GONE else View.VISIBLE
-
         val hasLog = logKb > 0
-        binding.btnShareLog.alpha = if (hasLog) 1.0f else 0.4f
+        binding.btnShareLog.alpha = if (hasLog) 1f else 0.4f
         binding.btnShareLog.text  =
-            if (hasLog) "📤 Share Debug Log (${logKb}KB)" else "📤 Share Debug Log"
+            if (hasLog) "\uD83D\uDCE4 Share Debug Log (${logKb}KB)" else "Share Debug Log"
     }
-
-    // ── Share log (plain text — no FileProvider needed) ───────────────────────
 
     private fun shareDebugLog() {
         val logger = discoveryLogger ?: run { toast("Logger not ready"); return }
-        val file   = logger.getDebugFile()
+        val file = logger.getDebugFile()
         if (!file.exists() || file.length() == 0L) {
-            toast("No log yet — start radar, enter a zone, wait 15 sec")
+            toast("Start radar \u2192 enter zone \u2192 wait 15s \u2192 share")
             return
         }
         try {
-            val header  = "ENT=${EntityStore.size()} DISP=${EventDispatcher.totalDispatched} " +
-                          "ADD=${EventDispatcher.totalAdded} DROP=${EventDispatcher.totalDropped}\n\n"
-            val content = header + file.readText()
-            startActivity(
-                Intent.createChooser(
-                    Intent(Intent.ACTION_SEND).apply {
-                        type = "text/plain"
-                        putExtra(Intent.EXTRA_TEXT, content)
-                        putExtra(Intent.EXTRA_SUBJECT, "GX Radar Debug Log")
-                    },
-                    "Share Debug Log"
-                )
-            )
+            val content = "dispatched=${EventDispatcher.totalDispatched} " +
+                "added=${EventDispatcher.totalAdded} dropped=${EventDispatcher.totalDropped}\n\n" +
+                file.readText()
+            startActivity(Intent.createChooser(
+                Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_TEXT, content)
+                    putExtra(Intent.EXTRA_SUBJECT, "GX Radar Debug Log")
+                }, "Share Log"
+            ))
         } catch (e: Exception) {
             toast("Share failed: ${e.message}")
         }
     }
 
-    // ── Start / Stop ──────────────────────────────────────────────────────────
-
     private fun checkAndStart() {
         if (!Settings.canDrawOverlays(this)) {
             AlertDialog.Builder(this)
                 .setTitle("Overlay Permission Required")
-                .setMessage(
-                    "GX Radar needs to draw over other apps.\n\n" +
-                    "1. Tap Open Settings\n" +
-                    "2. Enable Allow display over other apps\n" +
-                    "3. Return here and tap Start"
-                )
+                .setMessage("GX Radar needs to draw over other apps.\n\n1. Tap Open Settings\n2. Enable Allow display over other apps\n3. Return here and tap Start")
                 .setPositiveButton("Open Settings") { _, _ -> openOverlaySettings() }
                 .setNegativeButton("Cancel", null)
                 .show()
@@ -155,16 +133,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openOverlaySettings() {
-        startActivity(
-            Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:$packageName")
-            )
-        )
+        startActivity(Intent(
+            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+            Uri.parse("package:$packageName")
+        ))
     }
 
     private fun startServices() {
-        // Start VPN capture
         runCatching {
             startForegroundService(
                 Intent(this, AlbionVpnService::class.java)
@@ -172,7 +147,6 @@ class MainActivity : AppCompatActivity() {
             )
         }.onFailure { toast("VPN error: ${it.message}") }
 
-        // Start overlay stub (dots in Step 4)
         runCatching {
             startForegroundService(
                 Intent(this, RadarOverlayService::class.java)
@@ -185,20 +159,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopServices() {
-        // stopService() directly — works even if service crashed before
-        // registering its broadcast receiver (unlike sendBroadcast)
+        // Use stopService() directly — works even if service crashed before
+        // registering its broadcast receiver
         runCatching { stopService(Intent(this, AlbionVpnService::class.java)) }
         runCatching { stopService(Intent(this, RadarOverlayService::class.java)) }
         refreshUi()
         toast("GX Radar stopped")
     }
 
-    // ── isRunning: check notification IDs ────────────────────────────────────
-    // ActivityManager.getRunningServices() is deprecated and unreliable on newer Android.
-    // Checking active notifications is accurate and fast.
-
     private fun isRunning(): Boolean {
-        val nm = getSystemService(android.app.NotificationManager::class.java)
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         return nm.activeNotifications.any {
             it.id == AlbionVpnService.NOTIF_ID || it.id == RadarOverlayService.NOTIF_ID
         }
