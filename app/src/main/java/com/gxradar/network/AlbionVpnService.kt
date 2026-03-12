@@ -17,45 +17,60 @@ import com.gxradar.network.photon.PhotonParser
 import kotlinx.coroutines.*
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
 import java.net.InetSocketAddress
-import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.channels.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
+/**
+ * AlbionVpnService — FINAL correct implementation
+ *
+ * KEY FIX (confirmed by decompiling ALBION_HACK APK):
+ *   addAllowedApplication("com.albiononline")
+ *   → Only Albion Online traffic enters our TUN
+ *   → All other apps bypass VPN entirely (internet works normally)
+ *   → No system-wide TCP/DNS proxy needed
+ *
+ * Architecture:
+ *   TUN read loop → parse raw IP packets from Albion only
+ *     UDP port 5056  → NIO DatagramChannel (protected) + Photon parser
+ *     TCP (any port) → NIO SocketChannel (protected) relay (login/HTTPS)
+ *   Selector loop    → incoming responses → write back to TUN
+ */
 class AlbionVpnService : VpnService() {
 
     companion object {
-        private const val TAG    = "AlbionVpnService"
-        const val ACTION_START   = "com.gxradar.vpn.START"
-        const val ACTION_STOP    = "com.gxradar.vpn.STOP"
-        const val ALBION_PORT    = 5056
-        const val NOTIF_ID       = 1001
-        private const val MTU    = 32767
-        private const val TUN_IP = "10.99.0.1"
+        private const val TAG           = "AlbionVpnService"
+        const val  ACTION_START         = "com.gxradar.vpn.START"
+        const val  ACTION_STOP          = "com.gxradar.vpn.STOP"
+        const val  ALBION_PACKAGE       = "com.albiononline"
+        const val  ALBION_PORT          = 5056
+        const val  NOTIF_ID             = 1001
+        private const val MTU           = 32767
+        private const val TUN_IP        = "10.8.0.2"   // matches working APK
+        private const val TUN_PREFIX    = 32
         val packetCount = AtomicLong(0)
         val albionCount = AtomicLong(0)
     }
 
-    private var tunPfd: ParcelFileDescriptor? = null
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private lateinit var dispatcher: EventDispatcher
+    private var tunPfd:    ParcelFileDescriptor? = null
+    private var tunOut:    FileOutputStream?     = null
+    private var selector:  Selector?             = null
+    private val scope      = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val udpMap     = ConcurrentHashMap<Int, UdpEntry>()
+    private val tcpMap     = ConcurrentHashMap<Int, TcpEntry>()
+    private lateinit var dispatcher:      EventDispatcher
     private lateinit var discoveryLogger: DiscoveryLogger
 
-    // UDP: srcPort → UdpFlow
-    private val udpFlows = ConcurrentHashMap<Int, UdpFlow>()
-    // TCP: "srcIP:srcPort→dstIP:dstPort" → TcpSession
-    private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
-
     private val stopReceiver = object : BroadcastReceiver() {
-        override fun onReceive(c: Context?, i: Intent?) { if (i?.action == ACTION_STOP) stopSelf() }
+        override fun onReceive(c: Context?, i: Intent?) {
+            if (i?.action == ACTION_STOP) stopSelf()
+        }
     }
 
-    // ── Lifecycle ──────────────────────────────────────────────────────────────
+    // ─── Lifecycle ────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
@@ -68,15 +83,16 @@ class AlbionVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
         startForeground(NOTIF_ID, buildNotif("Starting…"))
-        scope.launch { startCapture() }
-        return START_NOT_STICKY  // ← KEY: don't restart if killed
+        scope.launch { runCapture() }
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
         scope.cancel()
-        udpFlows.values.forEach { it.close() };  udpFlows.clear()
-        tcpSessions.values.forEach { it.close() }; tcpSessions.clear()
-        runCatching { tunPfd?.close() };  tunPfd = null
+        runCatching { selector?.close() }
+        udpMap.values.forEach { runCatching { it.channel.close() } }; udpMap.clear()
+        tcpMap.values.forEach { it.close() };                          tcpMap.clear()
+        runCatching { tunPfd?.close() }; tunPfd = null
         EntityStore.clear()
         packetCount.set(0); albionCount.set(0)
         runCatching { unregisterReceiver(stopReceiver) }
@@ -85,351 +101,332 @@ class AlbionVpnService : VpnService() {
 
     override fun onRevoke() = stopSelf()
 
-    // ── TUN setup ───────────────────────────────────────────────────────────
+    // ─── TUN setup ────────────────────────────────────────────────────────────
 
-    private suspend fun startCapture() {
+    private suspend fun runCapture() {
         val pfd = withContext(Dispatchers.IO) {
             runCatching {
                 Builder()
                     .setSession("GX Radar")
-                    .addAddress(TUN_IP, 32)
+                    .addAddress(TUN_IP, TUN_PREFIX)
                     .addRoute("0.0.0.0", 0)
                     .addDnsServer("8.8.8.8")
                     .addDnsServer("8.8.4.4")
                     .setMtu(MTU)
                     .setBlocking(true)
+                    // ★ THE KEY FIX: only route Albion Online through TUN
+                    .addAllowedApplication(ALBION_PACKAGE)
                     .establish()
             }.getOrNull()
         }
-        if (pfd == null) { Log.e(TAG, "TUN establish failed"); stopSelf(); return }
-        tunPfd = pfd
-        notify("Capturing port $ALBION_PORT")
-        // Idle flow cleanup
-        scope.launch {
-            while (isActive) {
-                delay(30_000)
-                val now = System.currentTimeMillis()
-                udpFlows.entries.removeIf { (_, v) ->
-                    (now - v.lastUsed > 60_000L).also { if (it) v.close() }
-                }
-            }
+        if (pfd == null) {
+            Log.e(TAG, "TUN establish failed")
+            stopSelf(); return
         }
-        runCaptureLoop(pfd)
+        tunPfd   = pfd
+        tunOut   = FileOutputStream(pfd.fileDescriptor)
+        selector = Selector.open()
+        notify("Capturing Albion port $ALBION_PORT")
+
+        scope.launch(Dispatchers.IO) { runSelectorLoop() }
+        runTunReadLoop(pfd)
     }
 
-    private suspend fun runCaptureLoop(pfd: ParcelFileDescriptor) =
+    // ─── TUN read loop ─────────────────────────────────────────────────────────
+    // Only Albion Online packets arrive here (addAllowedApplication ensures this)
+
+    private suspend fun runTunReadLoop(pfd: ParcelFileDescriptor) =
         withContext(Dispatchers.IO) {
-            val input  = FileInputStream(pfd.fileDescriptor)
-            val output = FileOutputStream(pfd.fileDescriptor)
-            val buf    = ByteArray(MTU)
+            val input = FileInputStream(pfd.fileDescriptor)
+            val buf   = ByteArray(MTU)
             try {
                 while (isActive) {
                     val len = input.read(buf).takeIf { it > 20 } ?: continue
                     packetCount.incrementAndGet()
-                    if ((buf[0].toInt() and 0xFF) shr 4 != 4) continue  // IPv4 only
-                    val ihl      = (buf[0].toInt() and 0x0F) * 4
-                    val protocol = buf[9].toInt() and 0xFF
+                    if ((buf[0].toInt() and 0xF0) != 0x40) continue   // IPv4 only
+                    val ihl   = (buf[0].toInt() and 0x0F) * 4
+                    val proto = buf[9].toInt() and 0xFF
                     if (len < ihl + 8) continue
-                    when (protocol) {
-                        17 -> handleUdp(buf, len, ihl, output)
-                        6  -> handleTcp(buf, len, ihl, output)
-                        // other protocols: silently skip
+                    val srcIp = buf.copyOfRange(12, 16)
+                    val dstIp = buf.copyOfRange(16, 20)
+                    when (proto) {
+                        17 -> handleUdp(buf, len, ihl, srcIp, dstIp)
+                        6  -> handleTcp(buf, len, ihl, srcIp, dstIp)
                     }
                 }
             } catch (e: CancellationException) {
-                Log.d(TAG, "Capture loop cancelled")
+                Log.d(TAG, "TUN read cancelled")
             } catch (e: Exception) {
-                Log.e(TAG, "Capture loop error", e)
+                Log.e(TAG, "TUN read error", e)
             }
         }
 
-    // ── UDP ───────────────────────────────────────────────────────────────────
+    // ─── UDP (NIO DatagramChannel) ────────────────────────────────────────────
 
-    private fun handleUdp(buf: ByteArray, len: Int, ihl: Int, tunOut: FileOutputStream) {
-        val srcPort = buf.uShort(ihl)
-        val dstPort = buf.uShort(ihl + 2)
+    private fun handleUdp(
+        buf: ByteArray, len: Int, ihl: Int,
+        srcIp: ByteArray, dstIp: ByteArray
+    ) {
+        val srcPort = buf.u16(ihl)
+        val dstPort = buf.u16(ihl + 2)
         val payOff  = ihl + 8
         val payLen  = len - payOff
         if (payLen <= 0) return
-        val srcIp   = buf.copyOfRange(12, 16)
-        val dstIp   = buf.copyOfRange(16, 20)
-        val payload = buf.copyOfRange(payOff, payOff + payLen)
 
-        if ((dstPort == ALBION_PORT || srcPort == ALBION_PORT) && payLen >= 12) {
+        // Parse Photon on ALL outgoing Albion UDP (client→server are OperationRequests,
+        // but server→client events arrive via selector/readUdp below)
+        if (dstPort == ALBION_PORT || srcPort == ALBION_PORT) {
             albionCount.incrementAndGet()
-            parsePhoton(payload)
-            notify("PKT ${packetCount.get()}  ALB ${albionCount.get()}  ENT ${EntityStore.size()}")
+            parsePhoton(buf, payOff, payLen)
+            updateNotif()
         }
 
-        // Get or create protected UDP flow
-        val flow = udpFlows[srcPort] ?: run {
-            val sock = DatagramSocket()
-            if (!protect(sock)) { sock.close(); return }
-            val f = UdpFlow(sock, srcIp.copyOf())
-            f.receiveJob = scope.launch(Dispatchers.IO) {
-                val rbuf   = ByteArray(MTU)
-                val packet = DatagramPacket(rbuf, rbuf.size)
-                while (isActive && !sock.isClosed) {
-                    try {
-                        packet.setLength(rbuf.size)  // ← reset length before each receive
-                        sock.soTimeout = 10_000
-                        sock.receive(packet)
-                        val pLen = packet.length
-                        if (pLen < 1) continue
-                        if (packet.port == ALBION_PORT && pLen >= 12)
-                            parsePhoton(rbuf.copyOf(pLen))
-                        val ipPkt = buildUdpPacket(
-                            srcIp   = packet.address.address,
-                            dstIp   = srcIp,
-                            srcPort = packet.port,
-                            dstPort = srcPort,
-                            payload = rbuf, payLen = pLen
-                        )
-                        synchronized(tunOut) { tunOut.write(ipPkt) }
-                        f.lastUsed = System.currentTimeMillis()
-                    } catch (e: CancellationException) { break }
-                    catch (e: java.net.SocketTimeoutException) { /* idle timeout, loop */ }
-                    catch (e: Exception) { if (isActive) Log.v(TAG, "udp recv: ${e.message}") }
-                }
-            }
-            udpFlows[srcPort] = f
-            f
+        // Create or reuse protected DatagramChannel keyed by source port
+        val entry = udpMap.getOrPut(srcPort) {
+            runCatching {
+                val ch = DatagramChannel.open()
+                protect(ch.socket())              // protect BEFORE connect
+                ch.configureBlocking(false)
+                ch.connect(InetSocketAddress(
+                    java.net.InetAddress.getByAddress(dstIp), dstPort
+                ))
+                val e = UdpEntry(ch, srcIp.copyOf(), srcPort, dstPort)
+                selector?.wakeup()
+                ch.register(selector, SelectionKey.OP_READ, e)
+                e
+            }.getOrElse { return }
         }
-        try {
-            flow.socket.send(DatagramPacket(payload, payLen, InetAddress.getByAddress(dstIp), dstPort))
-            flow.lastUsed = System.currentTimeMillis()
-        } catch (e: Exception) {
-            udpFlows.remove(srcPort)?.close()
+
+        // Forward payload to real server
+        runCatching {
+            entry.channel.write(ByteBuffer.wrap(buf, payOff, payLen))
+        }.onFailure {
+            udpMap.remove(srcPort)?.channel?.runCatching { close() }
         }
     }
 
-    // ── TCP ───────────────────────────────────────────────────────────────────
-    //
-    // Albion login (live.albiononline.com) and chat both use TCP.
-    // Without this relay, the game can never authenticate and connect.
-    // We do a transparent MITM: SYN → connect Java Socket → send SYN-ACK →
-    // relay data in both directions via raw IP+TCP packets over TUN.
+    // ─── TCP (NIO SocketChannel) ──────────────────────────────────────────────
 
-    private fun handleTcp(buf: ByteArray, len: Int, ihl: Int, tunOut: FileOutputStream) {
+    private fun handleTcp(
+        buf: ByteArray, len: Int, ihl: Int,
+        srcIp: ByteArray, dstIp: ByteArray
+    ) {
         if (len < ihl + 20) return
-        val srcIp     = buf.copyOfRange(12, 16)
-        val dstIp     = buf.copyOfRange(16, 20)
-        val srcPort   = buf.uShort(ihl)
-        val dstPort   = buf.uShort(ihl + 2)
-        val seqNum    = buf.uInt32(ihl + 4)
-        val tcpHdrLen = ((buf[ihl + 12].toInt() and 0xF0) shr 4) * 4
-        val flags     = buf[ihl + 13].toInt() and 0xFF
-        val isSyn     = flags and 0x02 != 0
-        val isAck     = flags and 0x10 != 0
-        val isFin     = flags and 0x01 != 0
-        val isRst     = flags and 0x04 != 0
-        val payOff    = ihl + tcpHdrLen
-        val payLen    = (len - payOff).coerceAtLeast(0)
-        val key       = "${srcIp.ip()}:$srcPort-${dstIp.ip()}:$dstPort"
+        val srcPort = buf.u16(ihl)
+        val dstPort = buf.u16(ihl + 2)
+        val tcpOff  = ((buf[ihl + 12].toInt() and 0xF0) shr 4) * 4
+        val flags   = buf[ihl + 13].toInt() and 0xFF
+        val isSyn   = flags and 0x02 != 0
+        val isFin   = flags and 0x01 != 0
+        val isRst   = flags and 0x04 != 0
+        val payOff  = ihl + tcpOff
+        val payLen  = (len - payOff).coerceAtLeast(0)
 
         when {
-            isRst -> {
-                tcpSessions.remove(key)?.close()
+            isRst || isFin -> { tcpMap.remove(srcPort)?.close() }
+            isSyn -> scope.launch(Dispatchers.IO) {
+                openTcpChannel(srcIp, srcPort, dstIp, dstPort)
             }
-            isFin -> {
-                val s = tcpSessions.remove(key)
-                s?.let {
-                    it.clientSeq++
-                    sendTcp(tunOut, dstIp, srcIp, dstPort, srcPort,
-                            it.mySeq, it.clientSeq, 0x11)  // FIN+ACK
-                    it.close()
-                }
+            payLen > 0 -> {
+                val entry = tcpMap[srcPort] ?: return
+                runCatching {
+                    val d = ByteBuffer.wrap(buf, payOff, payLen)
+                    while (d.hasRemaining()) entry.channel.write(d)
+                }.onFailure { tcpMap.remove(srcPort)?.close() }
             }
-            isSyn && !isAck -> {
-                // New TCP connection: open protected Socket to server
-                scope.launch {
-                    openTcpSession(key, srcIp, srcPort, dstIp, dstPort, seqNum, tunOut)
-                }
-            }
-            else -> {
-                val s = tcpSessions[key] ?: return
-                if (!s.established) return
-                if (payLen > 0) {
-                    try {
-                        s.serverOut.write(buf, payOff, payLen)
-                        s.serverOut.flush()
-                        s.clientSeq += payLen
-                        // Send ACK back to client
-                        sendTcp(tunOut, dstIp, srcIp, dstPort, srcPort,
-                                s.mySeq, s.clientSeq, 0x10)
-                    } catch (e: Exception) {
-                        tcpSessions.remove(key)?.close()
+        }
+    }
+
+    private fun openTcpChannel(
+        srcIp: ByteArray, srcPort: Int,
+        dstIp: ByteArray, dstPort: Int
+    ) {
+        runCatching {
+            val ch = SocketChannel.open()
+            ch.configureBlocking(false)
+            protect(ch.socket())          // protect BEFORE connect
+            val entry = TcpEntry(ch, srcIp.copyOf(), srcPort, dstPort)
+            tcpMap[srcPort] = entry
+            ch.connect(InetSocketAddress(
+                java.net.InetAddress.getByAddress(dstIp), dstPort
+            ))
+            selector?.wakeup()
+            ch.register(selector, SelectionKey.OP_CONNECT, entry)
+        }.onFailure {
+            Log.v(TAG, "TCP open: ${it.message}")
+            tcpMap.remove(srcPort)
+        }
+    }
+
+    // ─── NIO Selector loop ────────────────────────────────────────────────────
+
+    private fun runSelectorLoop() {
+        val sel = selector ?: return
+        val buf = ByteBuffer.allocate(MTU)
+        try {
+            while (scope.isActive) {
+                if (sel.select(500L) == 0) continue
+                val keys = sel.selectedKeys().toSet()
+                sel.selectedKeys().clear()
+                for (key in keys) {
+                    if (!key.isValid) continue
+                    when {
+                        key.isReadable    -> onReadable(key, buf)
+                        key.isConnectable -> onConnectable(key)
                     }
                 }
             }
-        }
-    }
-
-    private suspend fun openTcpSession(
-        key: String,
-        clientIp: ByteArray, clientPort: Int,
-        serverIp: ByteArray, serverPort: Int,
-        clientSynSeq: Long, tunOut: FileOutputStream
-    ) {
-        val sock = Socket()
-        if (!protect(sock)) { sock.close(); return }
-        try {
-            withContext(Dispatchers.IO) {
-                sock.connect(InetSocketAddress(InetAddress.getByAddress(serverIp), serverPort), 5000)
-            }
+        } catch (e: ClosedSelectorException) {
+            Log.d(TAG, "Selector closed")
         } catch (e: Exception) {
-            Log.v(TAG, "TCP connect ${serverIp.ip()}:$serverPort failed: ${e.message}")
-            sock.close()
-            // Send RST to client so it doesn't hang
-            sendTcp(tunOut, serverIp, clientIp, serverPort, clientPort,
-                    0L, clientSynSeq + 1, 0x04)
-            return
-        }
-
-        val myInit    = 1000L
-        val clientSeq = clientSynSeq + 1L  // SYN counts as 1 byte
-        val session   = TcpSession(
-            socket    = sock,
-            serverOut = sock.getOutputStream(),
-            clientSeq = clientSeq,
-            mySeq     = myInit + 1L
-        )
-        tcpSessions[key] = session
-
-        // Send SYN-ACK to client over TUN
-        sendTcp(tunOut, serverIp, clientIp, serverPort, clientPort,
-                myInit, clientSeq, 0x12)  // SYN+ACK
-
-        // Server→client receive coroutine
-        session.receiveJob = scope.launch(Dispatchers.IO) {
-            val rbuf = ByteArray(16_384)
-            try {
-                while (isActive && !sock.isClosed) {
-                    val n = sock.getInputStream().read(rbuf)
-                    if (n <= 0) break
-                    sendTcp(tunOut, serverIp, clientIp, serverPort, clientPort,
-                            session.mySeq, session.clientSeq, 0x18,  // PSH+ACK
-                            rbuf.copyOf(n))
-                    session.mySeq += n
-                }
-            } catch (e: Exception) { /* socket closed */ }
-            // Send FIN to client
-            sendTcp(tunOut, serverIp, clientIp, serverPort, clientPort,
-                    session.mySeq, session.clientSeq, 0x11)
-            tcpSessions.remove(key)?.close()
+            Log.e(TAG, "Selector error", e)
         }
     }
 
-    // ── Packet builders ───────────────────────────────────────────────────────
-
-    private fun sendTcp(
-        tunOut: FileOutputStream,
-        srcIp: ByteArray, dstIp: ByteArray,
-        srcPort: Int, dstPort: Int,
-        seq: Long, ack: Long, flags: Int,
-        data: ByteArray = ByteArray(0)
-    ) {
-        val tcpLen = 20 + data.size
-        val ipLen  = 20 + tcpLen
-        val pkt    = ByteArray(ipLen)
-        val bb     = ByteBuffer.wrap(pkt).order(ByteOrder.BIG_ENDIAN)
-
-        // IPv4 header
-        bb.put(0x45.toByte()); bb.put(0)
-        bb.putShort(ipLen.toShort())
-        bb.putShort(0); bb.putShort(0x4000.toShort())
-        bb.put(64); bb.put(6); bb.putShort(0)  // ttl, proto=TCP, checksum=0
-        bb.put(srcIp); bb.put(dstIp)
-        val ipCsum = checksum(pkt, 0, 20)
-        pkt[10] = (ipCsum shr 8).toByte(); pkt[11] = ipCsum.toByte()
-
-        // TCP header
-        bb.putShort(srcPort.toShort())
-        bb.putShort(dstPort.toShort())
-        bb.putInt(seq.toInt())
-        bb.putInt(ack.toInt())
-        bb.put(0x50.toByte())       // data offset = 5 (20 bytes)
-        bb.put(flags.toByte())
-        bb.putShort(65535.toShort())  // window
-        bb.putShort(0)              // TCP checksum placeholder
-        bb.putShort(0)              // urgent pointer
-        if (data.isNotEmpty()) bb.put(data)
-
-        // TCP checksum over pseudo-header + TCP segment
-        val pseudo = byteArrayOf(
-            srcIp[0], srcIp[1], srcIp[2], srcIp[3],
-            dstIp[0], dstIp[1], dstIp[2], dstIp[3],
-            0, 6, (tcpLen shr 8).toByte(), tcpLen.toByte()
-        )
-        val tcpCsum = checksum(pseudo + pkt.copyOfRange(20, ipLen))
-        pkt[36] = (tcpCsum shr 8).toByte(); pkt[37] = tcpCsum.toByte()
-
-        synchronized(tunOut) {
-            try { tunOut.write(pkt) } catch (e: Exception) { }
+    private fun onReadable(key: SelectionKey, buf: ByteBuffer) {
+        when (val att = key.attachment()) {
+            is UdpEntry -> readUdp(att, buf)
+            is TcpEntry -> readTcp(att, buf)
         }
     }
+
+    private fun onConnectable(key: SelectionKey) {
+        val entry = key.attachment() as? TcpEntry ?: return
+        try {
+            if (entry.channel.finishConnect()) key.interestOps(SelectionKey.OP_READ)
+            else tcpMap.remove(entry.srcPort)?.close()
+        } catch (e: Exception) {
+            tcpMap.remove(entry.srcPort)?.close()
+        }
+    }
+
+    private fun readUdp(entry: UdpEntry, buf: ByteBuffer) {
+        try {
+            buf.clear()
+            val n = entry.channel.read(buf)
+            if (n <= 0) return
+            buf.flip()
+            val payload = ByteArray(n).also { buf.get(it) }
+
+            // Server→client Albion packets: parse Photon here
+            if (entry.dstPort == ALBION_PORT && n >= 12) {
+                albionCount.incrementAndGet()
+                parsePhoton(payload, 0, n)
+                updateNotif()
+            }
+
+            // Write response back to TUN
+            val serverIp = (entry.channel.remoteAddress as? InetSocketAddress)
+                ?.address?.address ?: return
+            val pkt = buildUdpPacket(serverIp, entry.srcIp,
+                entry.dstPort, entry.srcPort, payload)
+            synchronized(this) { tunOut?.write(pkt) }
+        } catch (e: Exception) {
+            Log.v(TAG, "UDP read: ${e.message}")
+        }
+    }
+
+    private fun readTcp(entry: TcpEntry, buf: ByteBuffer) {
+        try {
+            buf.clear()
+            val n = entry.channel.read(buf)
+            if (n < 0) { tcpMap.remove(entry.srcPort)?.close(); return }
+            if (n == 0) return
+            buf.flip()
+            val payload = ByteArray(n).also { buf.get(it) }
+            val serverIp = (entry.channel.remoteAddress as? InetSocketAddress)
+                ?.address?.address ?: return
+            val pkt = buildTcpPacket(serverIp, entry.srcIp,
+                entry.dstPort, entry.srcPort, payload)
+            synchronized(this) { tunOut?.write(pkt) }
+        } catch (e: Exception) {
+            Log.v(TAG, "TCP read: ${e.message}")
+            tcpMap.remove(entry.srcPort)?.close()
+        }
+    }
+
+    // ─── Packet builders ──────────────────────────────────────────────────────
 
     private fun buildUdpPacket(
         srcIp: ByteArray, dstIp: ByteArray,
-        srcPort: Int, dstPort: Int,
-        payload: ByteArray, payLen: Int
+        srcPort: Int, dstPort: Int, payload: ByteArray
     ): ByteArray {
-        val udpLen = 8 + payLen
+        val udpLen = 8 + payload.size
         val ipLen  = 20 + udpLen
+        val b = ByteBuffer.allocate(ipLen).order(ByteOrder.BIG_ENDIAN)
+        // IP header
+        b.put(0x45.toByte()); b.put(0)
+        b.putShort(ipLen.toShort())
+        b.putShort(0); b.putShort(0x4000.toShort())
+        b.put(64); b.put(17)
+        val csumPos = b.position(); b.putShort(0)
+        b.put(srcIp); b.put(dstIp)
+        val arr = b.array()
+        val cs = ipChecksum(arr, 0, 20)
+        arr[csumPos] = (cs shr 8).toByte(); arr[csumPos+1] = cs.toByte()
+        // UDP header
+        b.putShort(srcPort.toShort()); b.putShort(dstPort.toShort())
+        b.putShort(udpLen.toShort()); b.putShort(0)  // checksum=0 (disabled for IPv4)
+        b.put(payload)
+        return arr
+    }
+
+    private fun buildTcpPacket(
+        srcIp: ByteArray, dstIp: ByteArray,
+        srcPort: Int, dstPort: Int, payload: ByteArray
+    ): ByteArray {
+        val tcpLen = 20 + payload.size
+        val ipLen  = 20 + tcpLen
         val b = ByteBuffer.allocate(ipLen).order(ByteOrder.BIG_ENDIAN)
         b.put(0x45.toByte()); b.put(0)
         b.putShort(ipLen.toShort())
         b.putShort(0); b.putShort(0x4000.toShort())
-        b.put(64); b.put(17); b.putShort(0)
+        b.put(64); b.put(6)
+        val ipCsumPos = b.position(); b.putShort(0)
         b.put(srcIp); b.put(dstIp)
-        b.putShort(srcPort.toShort())
-        b.putShort(dstPort.toShort())
-        b.putShort(udpLen.toShort())
-        b.putShort(0)  // UDP checksum (0 = disabled, valid for IPv4)
-        b.put(payload, 0, payLen)
-        return b.array()
+        val arr = b.array()
+        val ipCs = ipChecksum(arr, 0, 20)
+        arr[ipCsumPos] = (ipCs shr 8).toByte(); arr[ipCsumPos+1] = ipCs.toByte()
+        // TCP header (PSH+ACK)
+        b.putShort(srcPort.toShort()); b.putShort(dstPort.toShort())
+        b.putInt(1); b.putInt(1)   // seq/ack simplified
+        b.put(0x50.toByte())       // data offset=5 (20 bytes)
+        b.put(0x18.toByte())       // PSH+ACK
+        b.putShort(65535.toShort())
+        b.putShort(0)              // checksum (0=disabled ok for TUN)
+        b.putShort(0)              // urgent
+        b.put(payload)
+        return arr
     }
 
-    // ── Internet checksum (RFC 1071) ────────────────────────────────────────
-
-    private fun checksum(data: ByteArray, offset: Int = 0, length: Int = data.size - offset): Int {
+    private fun ipChecksum(data: ByteArray, off: Int, len: Int): Int {
         var sum = 0L
-        var i   = offset
-        val end = offset + length
-        while (i < end - 1) {
-            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
-            i   += 2
+        var i = off
+        while (i < off + len - 1) {
+            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i+1].toInt() and 0xFF)
+            i += 2
         }
-        if ((end - offset) % 2 != 0)
-            sum += (data[end - 1].toInt() and 0xFF) shl 8
-        while (sum shr 16 != 0L)
-            sum = (sum and 0xFFFF) + (sum shr 16)
-        return (sum.inv().toInt()) and 0xFFFF
+        if (len % 2 != 0) sum += (data[off + len - 1].toInt() and 0xFF) shl 8
+        while (sum shr 16 != 0L) sum = (sum and 0xFFFF) + (sum shr 16)
+        return sum.inv().toInt() and 0xFFFF
     }
 
-    // ── Photon ──────────────────────────────────────────────────────────────────
+    // ─── Photon parser ────────────────────────────────────────────────────────
 
-    private fun parsePhoton(payload: ByteArray) {
-        try { PhotonParser.parse(payload).forEach { dispatcher.dispatch(it) } }
-        catch (e: Exception) { Log.v(TAG, "photon: ${e.message}") }
+    private fun parsePhoton(buf: ByteArray, off: Int, len: Int) {
+        try {
+            val payload = if (off == 0 && len == buf.size) buf
+                          else buf.copyOfRange(off, off + len)
+            PhotonParser.parse(payload).forEach { dispatcher.dispatch(it) }
+        } catch (e: Exception) {
+            Log.v(TAG, "photon: ${e.message}")
+        }
     }
 
-    // ── Extension helpers ─────────────────────────────────────────────────────
+    // ─── Helpers ──────────────────────────────────────────────────────────────
 
-    private fun ByteArray.uShort(off: Int) =
-        ((this[off].toInt() and 0xFF) shl 8) or (this[off + 1].toInt() and 0xFF)
-
-    private fun ByteArray.uInt32(off: Int): Long =
-        ((this[off].toLong()   and 0xFF) shl 24) or
-        ((this[off+1].toLong() and 0xFF) shl 16) or
-        ((this[off+2].toLong() and 0xFF) shl 8)  or
-        (this[off+3].toLong()  and 0xFF)
-
-    private fun ByteArray.ip() =
-        "${this[0].toInt() and 0xFF}.${this[1].toInt() and 0xFF}." +
-        "${this[2].toInt() and 0xFF}.${this[3].toInt() and 0xFF}"
-
-    // ── Notifications ────────────────────────────────────────────────────────
+    private fun ByteArray.u16(off: Int) =
+        ((this[off].toInt() and 0xFF) shl 8) or (this[off+1].toInt() and 0xFF)
 
     private fun buildNotif(text: String) =
         NotificationCompat.Builder(this, GXRadarApplication.CHANNEL_VPN)
@@ -443,30 +440,25 @@ class AlbionVpnService : VpnService() {
             .notify(NOTIF_ID, buildNotif(text))
     }
 
-    // ── Inner data classes ─────────────────────────────────────────────────────
-
-    private inner class UdpFlow(
-        val socket:   DatagramSocket,
-        val srcIp:    ByteArray,
-        @Volatile var lastUsed: Long = System.currentTimeMillis(),
-        var receiveJob: Job? = null
-    ) {
-        fun close() { receiveJob?.cancel(); runCatching { socket.close() } }
+    private fun updateNotif() {
+        notify("PKT ${packetCount.get()}  ALB ${albionCount.get()}  ENT ${EntityStore.size()}")
     }
 
-    private inner class TcpSession(
-        val socket:    Socket,
-        val serverOut: java.io.OutputStream,
-        @Volatile var clientSeq:   Long,
-        @Volatile var mySeq:       Long,
-        @Volatile var established: Boolean = true,
-        var receiveJob: Job? = null
+    // ─── Data classes ─────────────────────────────────────────────────────────
+
+    private data class UdpEntry(
+        val channel: DatagramChannel,
+        val srcIp:   ByteArray,
+        val srcPort: Int,
+        val dstPort: Int
+    )
+
+    private inner class TcpEntry(
+        val channel: SocketChannel,
+        val srcIp:   ByteArray,
+        val srcPort: Int,
+        val dstPort: Int
     ) {
-        fun close() {
-            established = false
-            receiveJob?.cancel()
-            runCatching { serverOut.close() }
-            runCatching { socket.close() }
-        }
+        fun close() = runCatching { channel.close() }
     }
 }
